@@ -6,7 +6,7 @@ import type {
   DesktopRpcParams,
   DesktopRpcResponses,
 } from "@edgeever/shared";
-import { docToText, type MemoDetail } from "@edgeever/shared";
+import { docToMarkdown, docToText, type MemoDetail } from "@edgeever/shared";
 import type { EdgeEverRepository } from "@/lib/repository";
 import { api, getConfiguredDesktopApiBaseUrl } from "@/lib/api";
 import { createStagedResourceListItem, mapMarkdownResourceUrls, mapTiptapResourceUrls, toApiResourceUrl, toDesktopResourceUrl } from "@/lib/desktop-resources";
@@ -162,6 +162,16 @@ export const createDesktopRepository = (): EdgeEverRepository => ({
       throw error;
     }
   },
+  renameResource: async (resourceId, filename) => {
+    const result = await api.renameResource(resourceId, filename);
+    await request("resource.cache", { resource: result.resource });
+    return { resource: { ...result.resource, url: toDesktopResourceUrl(result.resource.url) } };
+  },
+  deleteResource: async (resourceId) => {
+    const result = await api.deleteResource(resourceId);
+    await request("resource.delete", { resourceId });
+    return result;
+  },
   listTags: () => request("tag.list", {}),
   renameTag: (tag, name) => request("tag.rename", { tag, name }).then((result) => {
     window.dispatchEvent(new CustomEvent("edgeever:sync-queue-changed"));
@@ -195,7 +205,7 @@ export const createDesktopRepository = (): EdgeEverRepository => ({
   listMemos: (params) => {
     const rpcParams: DesktopMemoListParams = {
       ...params,
-      notebookId: params.notebookId ?? params.notebookIds?.[0] ?? null,
+      notebookId: params.notebookIds?.length ? null : (params.notebookId ?? null),
     };
     return request("memo.list", rpcParams);
   },
@@ -214,19 +224,29 @@ export const createDesktopRepository = (): EdgeEverRepository => ({
   },
 
   updateMemo: async (memo: MemoDetail, input) => {
+    const portableContentJson = mapTiptapResourceUrls(input.contentJson, toApiResourceUrl);
+    const contentMarkdown = input.contentMarkdown === undefined
+      ? docToMarkdown(portableContentJson)
+      : mapMarkdownResourceUrls(input.contentMarkdown, toApiResourceUrl);
     const rpcParams: DesktopMemoUpdateParams & { contentText: string } = {
       memoId: memo.id,
       expectedRevision: memo.revision,
       expectedContentHash: memo.contentHash,
       title: input.title,
-      contentJson: mapTiptapResourceUrls(input.contentJson, toApiResourceUrl),
-      contentMarkdown: mapMarkdownResourceUrls(input.contentMarkdown, toApiResourceUrl),
+      contentJson: portableContentJson,
+      contentMarkdown,
       contentText: docToText(input.contentJson),
       tags: input.tags,
     };
     const result = await request("memo.update", rpcParams);
     notifySyncQueueDeferred();
     return { memo: toDisplayMemo(result.memo), queued: true as const };
+  },
+
+  adoptCloudMemo: async (memoId) => {
+    const { discardDesktopMemoConflict } = await import("@/lib/desktop-sync");
+    const memo = await discardDesktopMemoConflict(memoId);
+    return { memo: toDisplayMemo(memo) };
   },
 
   deleteMemo: (memoId, permanent = false) => request("memo.delete", { memoId, permanent }).then((result) => {

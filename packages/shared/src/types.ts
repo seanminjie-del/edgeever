@@ -1,4 +1,5 @@
 import type { TiptapDoc } from "./content";
+import type { AiAction, AiPromptParameterKind, AiPromptResultMode } from "./ai-assistant";
 
 export type Notebook = {
   id: string;
@@ -101,6 +102,84 @@ export type ResourceStorageSummary = {
   totalBytes: number;
   imageCount: number;
   attachmentCount: number;
+};
+
+export type ObjectStorageSettings = {
+  provider: "builtin" | "s3";
+  displayName: string;
+  endpoint: string | null;
+  region: string | null;
+  bucket: string | null;
+  accessKeyId: string | null;
+  hasSecretAccessKey: boolean;
+  forcePathStyle: boolean;
+  objectPrefix: string;
+  encryptionConfigured: boolean;
+};
+
+export type AiProvider = "openai-compatible" | "anthropic" | "google";
+
+export type AiModelConfig = {
+  id: string;
+  providerConfigId: string;
+  modelId: string;
+  displayName: string;
+};
+
+export type AiProviderConfig = {
+  id: string;
+  provider: AiProvider;
+  displayName: string;
+  baseUrl: string;
+  isEnabled: boolean;
+  hasApiKey: boolean;
+  models: AiModelConfig[];
+};
+
+export type AiSettings = {
+  providers: AiProviderConfig[];
+  defaultModelId: string | null;
+  tagSuggestionPrompt: string;
+  tagSuggestionPromptCustomized: boolean;
+  encryptionConfigured: boolean;
+  readOnly: boolean;
+};
+
+export type AiPromptTemplate = {
+  id: string;
+  origin: "default" | "custom";
+  seedKey: Exclude<AiAction, "custom"> | null;
+  action: AiAction;
+  parameterKind: AiPromptParameterKind;
+  resultMode: AiPromptResultMode;
+  nameCustomized: boolean;
+  descriptionCustomized: boolean;
+  instructionCustomized: boolean;
+  name: string;
+  description: string | null;
+  instruction: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type AiDiscoveredModel = {
+  modelId: string;
+  displayName: string;
+};
+
+export type AiStreamEvent =
+  | { type: "start" }
+  | { type: "text-delta"; text: string }
+  | { type: "finish"; finishReason?: string; inputTokens?: number; outputTokens?: number }
+  | { type: "error"; code: string; message: string };
+
+export type AiTagSuggestion = {
+  name: string;
+  existing: boolean;
+};
+
+export type AiTagSuggestionsResponse = {
+  suggestions: AiTagSuggestion[];
 };
 
 export type ApiToken = {

@@ -1,11 +1,16 @@
+import "katex/dist/katex.min.css";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
+import { PdfAttachment } from "@/components/editor/PdfAttachment";
 import Image from "@tiptap/extension-image";
+import { TaskItem, TaskList } from "@tiptap/extension-list";
+import { mergeAttributes } from "@tiptap/core";
 import Placeholder from "@tiptap/extension-placeholder";
 import { TableKit } from "@tiptap/extension-table";
-import { createExcerpt, docToMarkdown, docToText, emptyDoc, type MemoDetail, type MemoEditSession, type Notebook, type TiptapDoc } from "@edgeever/shared";
+import { createExcerpt, docToMarkdown, docToText, emptyDoc, getImageReferrerPolicy, MergeDivider, type MemoDetail, type MemoEditSession, type Notebook, type TagSummary, type TiptapDoc } from "@edgeever/shared";
+import { createEdgeEverMathematics } from "@edgeever/shared/mathematics";
 import { getMobileEditorInputAttributes, getMobileEditorPlaceholder } from "@edgeever/shared/mobile-editor";
 import {
   MobileEditorFallback,
@@ -17,7 +22,7 @@ import {
 import { EDITOR_LOCAL_SAVE_DELAY_MS, getEditableMemoTitle, getNotebookMoveOptions } from "@/lib/app-helpers";
 import { defaultLocale, normalizeLocale } from "@/i18n/locales";
 import { compressImageForUpload } from "@/lib/image-compression";
-import { localDb, type LocalDraft } from "@/lib/local-db";
+import { localDb, type LocalDraft, type MemoUpdateSyncPayload } from "@/lib/local-db";
 import {
   getStandaloneMobileEditorReturnPath,
   markStandaloneMobileEditorReturning,
@@ -38,8 +43,28 @@ import {
   type MobileEditorSaveState,
 } from "@/lib/mobile-editor-standalone";
 import { getMemoUpdateQueueId, isMemoUpdateAlreadyApplied, queueMemoUpdate, shouldQueueMemoSaveError } from "@/lib/sync-queue";
-import { EdgeEverCodeBlock, codeBlockLowlight } from "@/lib/code-block";
+import { createMarkdownImagePasteRule } from "@/lib/markdown-image-paste";
+import { preserveEmptyListIndentOnBackspace, wrapIndentedParagraphInList } from "@/lib/editor-shortcuts";
 import { ThemeBlock } from "./ThemeBlock";
+import { EditorTagPicker } from "./EditorTagPicker";
+import { listLocalTags } from "@/lib/local-mirror";
+
+const ProtectedExternalImage = Image.extend({
+  addPasteRules() {
+    return [createMarkdownImagePasteRule(this.type)];
+  },
+  renderHTML({ HTMLAttributes }) {
+    const referrerPolicy = getImageReferrerPolicy(HTMLAttributes.src);
+    return [
+      "img",
+      mergeAttributes(
+        this.options.HTMLAttributes,
+        HTMLAttributes,
+        referrerPolicy ? { referrerpolicy: referrerPolicy } : {},
+      ),
+    ];
+  },
+});
 
 type ListNotebooksResponse = {
   notebooks: Notebook[];
@@ -170,10 +195,14 @@ export const MobileStandaloneTiptapEditor = ({
 
   const editor = useEditor({
     extensions: [
-      StarterKit.configure({ codeBlock: false }),
-      EdgeEverCodeBlock.configure({ lowlight: codeBlockLowlight, defaultLanguage: "plaintext" }),
+      StarterKit,
+      PdfAttachment,
+      TaskList,
+      TaskItem.configure({ nested: true }),
+      MergeDivider,
+      ...createEdgeEverMathematics(),
       ThemeBlock,
-      Image.configure({
+      ProtectedExternalImage.configure({
         allowBase64: false,
         inline: false,
       }),
@@ -187,6 +216,13 @@ export const MobileStandaloneTiptapEditor = ({
     content: emptyDoc(),
     editorProps: {
       attributes: getMobileEditorInputAttributes("edgeever-mobile-tiptap-content"),
+      handleKeyDown: (view, event) => {
+        if (event.key !== "Backspace" || !preserveEmptyListIndentOnBackspace(view.state, view.dispatch)) {
+          return false;
+        }
+        event.preventDefault();
+        return true;
+      },
     },
     onUpdate: ({ editor: activeEditor }) => {
       contentJsonRef.current = activeEditor.getJSON() as TiptapDoc;
@@ -518,6 +554,14 @@ export const MobileStandaloneTiptapEditor = ({
     scheduleMetadataSave();
   };
 
+  const loadTags = useCallback(async () => {
+    if (memoId) {
+      const localMemo = await localDb.memos.filter((candidate) => candidate.id === memoId).first();
+      if (localMemo) return listLocalTags(localMemo.scope);
+    }
+    return requestMobileEditorJson<{ tags: TagSummary[] }>("/api/v1/tags");
+  }, [memoId]);
+
   const handleNotebookChange = async (nextNotebookId: string) => {
     const currentMemo = memoRef.current;
     if (!currentMemo || !nextNotebookId || nextNotebookId === currentMemo.notebookId || notebookUpdatePending) {
@@ -700,6 +744,13 @@ export const MobileStandaloneTiptapEditor = ({
           queuedUpdate = undefined;
         }
         const useDraft = Boolean(draft && (queuedUpdate || Date.parse(draft.updatedAt || "") >= Date.parse(data.memo.updatedAt || "")));
+        const queuedPayload =
+          queuedUpdate && queuedUpdate.kind === "memo.update"
+            ? (queuedUpdate.payload as MemoUpdateSyncPayload)
+            : null;
+        const useQueuedPayload = Boolean(
+          queuedPayload && !useDraft && queuedUpdate && !isMemoUpdateAlreadyApplied(data.memo, queuedUpdate),
+        );
 
         setMemo(data.memo);
 
@@ -713,6 +764,23 @@ export const MobileStandaloneTiptapEditor = ({
           dirtyRef.current = true;
           setSaveStateStable("local-draft");
           scheduleMetadataSave();
+          focusEditorAfterLoad();
+        } else if (useQueuedPayload && queuedPayload) {
+          const queuedTitle = getEditableMemoTitle(queuedPayload.title);
+          const queuedTagsText = queuedPayload.tags.join(", ");
+          setTitle(queuedTitle);
+          titleRef.current = queuedTitle;
+          setTagsText(queuedTagsText);
+          tagsTextRef.current = queuedTagsText;
+          contentJsonRef.current = queuedPayload.contentJson || emptyDoc();
+          editor.commands.setContent(contentJsonRef.current, { emitUpdate: false });
+          lastSavedSnapshotRef.current = JSON.stringify({
+            title: queuedTitle,
+            tagsText: queuedTagsText,
+            contentJson: contentJsonRef.current,
+          });
+          dirtyRef.current = false;
+          setSaveStateStable("local-draft");
           focusEditorAfterLoad();
         } else {
           setTitle(nextTitle);
@@ -836,6 +904,8 @@ export const MobileStandaloneTiptapEditor = ({
     !memo || !editor || saveState === "loading" || saveState === "compressing" || saveState === "uploading" || saveState === "leaving";
   const currentNotebookLabel =
     notebookOptions.find((notebook) => notebook.id === memo?.notebookId)?.name ?? t("editor.notebookFallback");
+  const activeListItemType = editor?.isActive("taskItem") ? "taskItem" : "listItem";
+  const canWrapIndentedParagraph = Boolean(editor && wrapIndentedParagraphInList(editor.state, undefined));
 
   const fallbackMarkdown = memo ? docToMarkdown(contentJsonRef.current) : "";
   const runEditorCommand = (command: () => boolean) => {
@@ -868,14 +938,13 @@ export const MobileStandaloneTiptapEditor = ({
             disabled={!memo || notebookUpdatePending || saveState === "loading" || notebookOptions.length === 0}
             onOpen={() => setNotebookSheetOpen(true)}
           />
-          <input
-            className="mobile-editor-tags"
+          <EditorTagPicker
+            contentMarkdown={fallbackMarkdown}
+            disabled={!memo || saveState === "loading"}
+            loadTags={loadTags}
+            title={title}
             value={tagsText}
-            autoComplete="on"
-            autoCorrect="on"
-            inputMode="text"
-            placeholder={t("editor.tagPlaceholder")}
-            onChange={(event) => handleTagsChange(event.target.value)}
+            onChange={handleTagsChange}
           />
         </div>
 
@@ -883,15 +952,23 @@ export const MobileStandaloneTiptapEditor = ({
           disabled={editorActionDisabled}
           boldActive={Boolean(editor?.isActive("bold"))}
           bulletListActive={Boolean(editor?.isActive("bulletList"))}
-          increaseListIndentAvailable={Boolean(editor?.can().chain().focus().sinkListItem("listItem").run())}
-          decreaseListIndentAvailable={Boolean(editor?.can().chain().focus().liftListItem("listItem").run())}
+          taskListActive={Boolean(editor?.isActive("taskList"))}
+          increaseListIndentAvailable={canWrapIndentedParagraph || Boolean(editor?.can().chain().focus().sinkListItem(activeListItemType).run())}
+          decreaseListIndentAvailable={Boolean(editor?.can().chain().focus().liftListItem(activeListItemType).run())}
           blockquoteActive={Boolean(editor?.isActive("blockquote"))}
           locale={locale}
           onPickImage={() => imageInputRef.current?.click()}
           onToggleBold={() => runEditorCommand(() => editor?.chain().focus().toggleBold().run() ?? false)}
-          onToggleBulletList={() => runEditorCommand(() => editor?.chain().focus().toggleBulletList().run() ?? false)}
-          onIncreaseListIndent={() => runEditorCommand(() => editor?.chain().focus().sinkListItem("listItem").run() ?? false)}
-          onDecreaseListIndent={() => runEditorCommand(() => editor?.chain().focus().liftListItem("listItem").run() ?? false)}
+          onToggleBulletList={() => runEditorCommand(() => (
+            editor ? wrapIndentedParagraphInList(editor.state, editor.view.dispatch, "bulletList") || editor.commands.toggleBulletList() : false
+          ))}
+          onToggleTaskList={() => runEditorCommand(() => (
+            editor ? wrapIndentedParagraphInList(editor.state, editor.view.dispatch, "taskList") || editor.commands.toggleTaskList() : false
+          ))}
+          onIncreaseListIndent={() => runEditorCommand(() => (
+            editor ? wrapIndentedParagraphInList(editor.state, editor.view.dispatch) || editor.commands.sinkListItem(activeListItemType) : false
+          ))}
+          onDecreaseListIndent={() => runEditorCommand(() => editor?.chain().focus().liftListItem(activeListItemType).run() ?? false)}
           onToggleBlockquote={() => runEditorCommand(() => editor?.chain().focus().toggleBlockquote().run() ?? false)}
           onSetHorizontalRule={() => runEditorCommand(() => editor?.chain().focus().setHorizontalRule().run() ?? false)}
         />

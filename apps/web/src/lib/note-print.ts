@@ -2,6 +2,7 @@ import { DOMSerializer } from "@tiptap/pm/model";
 import type { Editor } from "@tiptap/react";
 import type { TiptapDoc } from "@edgeever/shared";
 import { getAppPagePath, getMessageTargetOrigin } from "@/lib/app-page-path";
+import { createClientUuid } from "@/lib/client-id";
 
 export const NOTE_PRINT_MESSAGE = "edgeever:note-print";
 export const NOTE_PRINT_READY_MESSAGE = "edgeever:note-print-ready";
@@ -41,10 +42,11 @@ export const serializeNoteDocumentForPrint = (editor: Editor, document: TiptapDo
 };
 
 export const openNotePrintPreview = (
-  payload: Omit<NotePrintPayload, "type" | "token">
+  payload: Omit<NotePrintPayload, "type" | "token">,
+  preopenedWindow?: Window,
 ) => {
-  const token = crypto.randomUUID();
-  let printWindow: Window | null = null;
+  const token = createClientUuid();
+  let printWindow: Window | null = preopenedWindow ?? null;
 
   const handleMessage = (event: MessageEvent<NotePrintReadyMessage>) => {
     if (
@@ -68,10 +70,18 @@ export const openNotePrintPreview = (
   };
 
   window.addEventListener("message", handleMessage);
-  printWindow = window.open(
-    `${NOTE_PRINT_PATH}?token=${encodeURIComponent(token)}`,
-    "_blank"
-  );
+  const printUrl = `${NOTE_PRINT_PATH}?token=${encodeURIComponent(token)}`;
+
+  if (printWindow) {
+    try {
+      printWindow.location.href = printUrl;
+    } catch {
+      window.removeEventListener("message", handleMessage);
+      return false;
+    }
+  } else {
+    printWindow = window.open(printUrl, "_blank");
+  }
 
   if (!printWindow) {
     window.removeEventListener("message", handleMessage);

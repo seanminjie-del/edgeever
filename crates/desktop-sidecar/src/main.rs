@@ -1,15 +1,16 @@
-use rusqlite::{backup::Backup, Connection, DatabaseName, OptionalExtension};
+mod database;
+
+use database::{
+    backup_database, data_dir, list_backups, migrations_dir, open_database, restore_database,
+};
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::env;
-use std::fs;
 use std::io::{self, BufRead, Write};
-use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Deserialize)]
 struct RpcRequest {
@@ -25,294 +26,6 @@ struct RpcError<'a> {
     message: String,
 }
 
-fn data_dir() -> PathBuf {
-    let args: Vec<String> = env::args().collect();
-    args.windows(2)
-        .find(|pair| pair[0] == "--data-dir")
-        .map(|pair| PathBuf::from(&pair[1]))
-        .unwrap_or_else(|| PathBuf::from(".edgeever-desktop"))
-}
-
-fn migrations_dir() -> PathBuf {
-    let args: Vec<String> = env::args().collect();
-    args.windows(2)
-        .find(|pair| pair[0] == "--migrations-dir")
-        .map(|pair| PathBuf::from(&pair[1]))
-        .unwrap_or_else(|| PathBuf::from("migrations"))
-}
-
-fn restrict_directory(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        let mut permissions = fs::metadata(path)?.permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(path, permissions)?;
-    }
-    Ok(())
-}
-
-fn restrict_file(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        if path.exists() {
-            let mut permissions = fs::metadata(path)?.permissions();
-            permissions.set_mode(0o600);
-            fs::set_permissions(path, permissions)?;
-        }
-    }
-    Ok(())
-}
-
-fn apply_migrations(connection: &Connection, migrations: &Path) -> rusqlite::Result<()> {
-    connection.execute_batch(
-        "CREATE TABLE IF NOT EXISTS _edgeever_migrations (
-           name TEXT PRIMARY KEY,
-           applied_at TEXT NOT NULL
-         );",
-    )?;
-
-    let mut files: Vec<PathBuf> = fs::read_dir(migrations)
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?
-        .filter_map(|entry| entry.ok().map(|item| item.path()))
-        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("sql"))
-        .collect();
-    files.sort();
-
-    for path in files {
-        let name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default();
-        let already_applied: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM _edgeever_migrations WHERE name = ?1)",
-            [name],
-            |row| row.get(0),
-        )?;
-        if already_applied {
-            continue;
-        }
-
-        let sql = fs::read_to_string(&path)
-            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-        let transaction = connection.unchecked_transaction()?;
-        transaction.execute_batch(&sql)?;
-        transaction.execute(
-            "INSERT INTO _edgeever_migrations (name, applied_at) VALUES (?1, datetime('now'))",
-            [name],
-        )?;
-        transaction.commit()?;
-    }
-    Ok(())
-}
-
-fn copy_directory(source: &Path, destination: &Path) -> io::Result<()> {
-    if !source.exists() {
-        return Ok(());
-    }
-    fs::create_dir_all(destination)?;
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let source_path = entry.path();
-        let destination_path = destination.join(entry.file_name());
-        if source_path.is_dir() {
-            copy_directory(&source_path, &destination_path)?;
-        } else {
-            fs::copy(source_path, destination_path)?;
-        }
-    }
-    Ok(())
-}
-
-fn backup_database(connection: &Connection, root: &Path) -> rusqlite::Result<PathBuf> {
-    let backup_dir = root.join("backups");
-    fs::create_dir_all(&backup_dir)
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    restrict_directory(&backup_dir)
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    let backup_path = backup_dir.join(format!(
-        "edgeever-{}.sqlite",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    ));
-    let backup_path_text = backup_path.to_string_lossy().to_string();
-    connection.execute("VACUUM INTO ?1", [&backup_path_text])?;
-    restrict_file(&backup_path)
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    let resource_backup = backup_path.with_extension("resources");
-    fs::remove_dir_all(&resource_backup).ok();
-    copy_directory(&root.join("resource-outbox"), &resource_backup)
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    let mut backups: Vec<PathBuf> = fs::read_dir(&backup_dir)
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?
-        .filter_map(|entry| entry.ok().map(|item| item.path()))
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| name.starts_with("edgeever-") && name.ends_with(".sqlite"))
-                .unwrap_or(false)
-        })
-        .collect();
-    backups.sort();
-    while backups.len() > 5 {
-        if let Some(oldest) = backups.first() {
-            fs::remove_file(oldest)
-                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-            fs::remove_dir_all(oldest.with_extension("resources")).ok();
-        }
-        backups.remove(0);
-    }
-    Ok(backup_path)
-}
-
-fn list_backups(root: &Path) -> rusqlite::Result<Value> {
-    let backup_dir = root.join("backups");
-    fs::create_dir_all(&backup_dir)
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    let mut backups = Vec::new();
-    for entry in fs::read_dir(&backup_dir)
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?
-    {
-        let path = entry
-            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?
-            .path();
-        let name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default()
-            .to_owned();
-        if !name.starts_with("edgeever-") || !name.ends_with(".sqlite") {
-            continue;
-        }
-        let metadata = fs::metadata(&path)
-            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-        let modified_at = metadata
-            .modified()
-            .ok()
-            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-            .map(|value| value.as_secs().to_string())
-            .unwrap_or_default();
-        backups.push(json!({ "path": path.to_string_lossy(), "name": name, "size": metadata.len(), "modifiedAt": modified_at }));
-    }
-    backups.sort_by(|left, right| {
-        right
-            .get("name")
-            .and_then(Value::as_str)
-            .cmp(&left.get("name").and_then(Value::as_str))
-    });
-    Ok(json!({ "backups": backups }))
-}
-
-fn restore_database(
-    database: &mut Connection,
-    root: &Path,
-    migrations: &Path,
-    params: &Value,
-) -> Result<Value, String> {
-    let requested = string_param(params, "path")?;
-    let backup_dir = root
-        .join("backups")
-        .canonicalize()
-        .map_err(|error| error.to_string())?;
-    let backup_path = PathBuf::from(requested)
-        .canonicalize()
-        .map_err(|error| error.to_string())?;
-    if backup_path.parent() != Some(backup_dir.as_path())
-        || backup_path.extension().and_then(|value| value.to_str()) != Some("sqlite")
-    {
-        return Err("Backup path must point to a managed EdgeEver backup".to_owned());
-    }
-
-    // Windows refuses to rotate/delete a backup while a read connection still
-    // holds the managed file open. Restore from a temporary copy so retention
-    // can safely remove the selected snapshot when it is the oldest one.
-    let source_copy = root.join(".edgeever-restore-source.sqlite");
-    fs::remove_file(&source_copy).ok();
-    fs::copy(&backup_path, &source_copy).map_err(|error| error.to_string())?;
-    let source = Connection::open(&source_copy).map_err(|error| error.to_string())?;
-    // A protective backup rotates the five-file retention window. Preserve the
-    // selected snapshot's resource companion before that rotation can remove
-    // it when the user restores the oldest retained backup.
-    let resource_backup = backup_path.with_extension("resources");
-    let resource_restore_source = root.join("resource-outbox.restore-source");
-    fs::remove_dir_all(&resource_restore_source).ok();
-    if resource_backup.is_dir() {
-        copy_directory(&resource_backup, &resource_restore_source)
-            .map_err(|error| error.to_string())?;
-    }
-    // Open the selected snapshot before rotation: if it is the oldest of the
-    // five retained files, the protective backup may remove its directory
-    // entry while this read-only connection keeps the snapshot available.
-    let protective_backup = backup_database(&*database, root).map_err(|error| error.to_string())?;
-    let backup = Backup::new_with_names(&source, DatabaseName::Main, database, DatabaseName::Main)
-        .map_err(|error| error.to_string())?;
-    backup
-        .run_to_completion(100, Duration::from_millis(5), None)
-        .map_err(|error| error.to_string())?;
-    drop(backup);
-    drop(source);
-    fs::remove_file(&source_copy).map_err(|error| error.to_string())?;
-    apply_migrations(database, migrations).map_err(|error| error.to_string())?;
-    let resource_source = if resource_restore_source.is_dir() {
-        resource_restore_source.as_path()
-    } else {
-        resource_backup.as_path()
-    };
-    if resource_source.is_dir() {
-        let restored_resources = root.join("resource-outbox.restore");
-        fs::remove_dir_all(&restored_resources).ok();
-        copy_directory(resource_source, &restored_resources).map_err(|error| error.to_string())?;
-        fs::remove_dir_all(root.join("resource-outbox")).ok();
-        fs::rename(restored_resources, root.join("resource-outbox"))
-            .map_err(|error| error.to_string())?;
-    }
-    fs::remove_dir_all(&resource_restore_source).ok();
-    Ok(json!({ "ok": true, "path": protective_backup }))
-}
-
-fn open_database(root: &Path, migrations: &Path) -> rusqlite::Result<Connection> {
-    fs::create_dir_all(root)
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    restrict_directory(root)
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    let existed = root.join("edgeever.sqlite").exists();
-    let connection = Connection::open(root.join("edgeever.sqlite"))?;
-    connection.pragma_update(None, "journal_mode", "WAL")?;
-    connection.execute_batch(
-        "CREATE TABLE IF NOT EXISTS _edgeever_sidecar_meta (
-           key TEXT PRIMARY KEY,
-           value TEXT NOT NULL,
-           updated_at TEXT NOT NULL
-         );
-         CREATE TABLE IF NOT EXISTS _edgeever_sidecar_outbox (
-           id INTEGER PRIMARY KEY AUTOINCREMENT,
-           kind TEXT NOT NULL,
-           entity_id TEXT NOT NULL,
-           payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
-           status TEXT NOT NULL DEFAULT 'pending',
-           attempt_count INTEGER NOT NULL DEFAULT 0,
-           last_error TEXT,
-           created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-           updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-         );
-         CREATE INDEX IF NOT EXISTS idx_sidecar_outbox_status ON _edgeever_sidecar_outbox(status, id);",
-    )?;
-    if existed {
-        backup_database(&connection, root)?;
-    }
-    apply_migrations(&connection, migrations)?;
-    for path in [
-        root.join("edgeever.sqlite"),
-        root.join("edgeever.sqlite-wal"),
-        root.join("edgeever.sqlite-shm"),
-    ] {
-        restrict_file(&path)
-            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    }
-    Ok(connection)
-}
-
 fn enqueue_change(
     database: &Connection,
     kind: &str,
@@ -320,15 +33,15 @@ fn enqueue_change(
     payload: &Value,
 ) -> Result<(), String> {
     if kind == "memo.update" {
-        let existing: Option<(i64, String)> = database
+        let existing: Option<(i64, String, String)> = database
             .query_row(
-                "SELECT id, payload_json FROM _edgeever_sidecar_outbox WHERE kind = 'memo.update' AND entity_id = ?1 AND status IN ('pending', 'error') ORDER BY id LIMIT 1",
+                "SELECT id, payload_json, status FROM _edgeever_sidecar_outbox WHERE kind = 'memo.update' AND entity_id = ?1 AND status IN ('pending', 'error', 'conflict') ORDER BY id LIMIT 1",
                 [entity_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(|e| e.to_string())?;
-        if let Some((outbox_id, existing_payload)) = existing {
+        if let Some((outbox_id, existing_payload, existing_status)) = existing {
             let previous: Value =
                 serde_json::from_str(&existing_payload).unwrap_or_else(|_| json!({}));
             let mut merged = payload.clone();
@@ -344,10 +57,19 @@ fn enqueue_change(
                     }
                 }
             }
-            database.execute(
-                "UPDATE _edgeever_sidecar_outbox SET payload_json = ?1, status = 'pending', last_error = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?2",
-                rusqlite::params![merged.to_string(), outbox_id],
-            ).map(|_| ()).map_err(|e| e.to_string())?;
+            database
+                .execute(
+                    "UPDATE _edgeever_sidecar_outbox
+                 SET payload_json = ?1,
+                     status = ?2,
+                     last_error = CASE WHEN ?2 = 'conflict' THEN last_error ELSE NULL END,
+                     version = version + 1,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE id = ?3",
+                    rusqlite::params![merged.to_string(), existing_status, outbox_id],
+                )
+                .map(|_| ())
+                .map_err(|e| e.to_string())?;
             return Ok(());
         }
     }
@@ -355,6 +77,43 @@ fn enqueue_change(
         "INSERT INTO _edgeever_sidecar_outbox (kind, entity_id, payload_json) VALUES (?1, ?2, ?3)",
         rusqlite::params![kind, entity_id, payload.to_string()],
     ).map(|_| ()).map_err(|e| e.to_string())
+}
+
+fn memo_remap_base_key(memo_id: &str) -> String {
+    format!("memo.remap-base:{memo_id}")
+}
+
+fn resolve_remapped_memo_base(
+    database: &Connection,
+    memo_id: &str,
+    expected_revision: i64,
+    expected_content_hash: &str,
+) -> (i64, String, bool) {
+    let key = memo_remap_base_key(memo_id);
+    let Some(marker) =
+        meta_value(database, &key).and_then(|value| serde_json::from_str::<Value>(&value).ok())
+    else {
+        return (expected_revision, expected_content_hash.to_owned(), false);
+    };
+    let matches_temporary_base = marker.get("temporaryRevision").and_then(Value::as_i64)
+        == Some(expected_revision)
+        && marker.get("temporaryContentHash").and_then(Value::as_str)
+            == Some(expected_content_hash);
+    if !matches_temporary_base {
+        return (expected_revision, expected_content_hash.to_owned(), false);
+    }
+    (
+        marker
+            .get("remoteRevision")
+            .and_then(Value::as_i64)
+            .unwrap_or(expected_revision),
+        marker
+            .get("remoteContentHash")
+            .and_then(Value::as_str)
+            .unwrap_or(expected_content_hash)
+            .to_owned(),
+        true,
+    )
 }
 
 fn meta_value(database: &Connection, key: &str) -> Option<String> {
@@ -846,6 +605,14 @@ fn cache_resource(database: &Connection, params: &Value) -> Result<Value, String
     Ok(json!({ "ok": true }))
 }
 
+fn delete_cached_resource(database: &Connection, params: &Value) -> Result<Value, String> {
+    let resource_id = string_param(params, "resourceId")?;
+    database
+        .execute("DELETE FROM resources WHERE id = ?1", [&resource_id])
+        .map_err(|e| e.to_string())?;
+    Ok(json!({ "ok": true }))
+}
+
 fn list_tags(database: &Connection) -> Result<Value, String> {
     let mut statement = database.prepare(
         "SELECT trim(j.value) AS name, COUNT(DISTINCT m.id) AS memo_count, MAX(m.updated_at) AS updated_at
@@ -1029,7 +796,7 @@ fn merge_memos(database: &Connection, params: &Value) -> Result<Value, String> {
     let mut markdowns = Vec::new();
     let mut tags = Vec::<String>::new();
     for id in &ids {
-        let row = database.query_row("SELECT m.title, m.notebook_id, c.content_markdown, m.tags_json FROM memos m JOIN memo_contents c ON c.memo_id = m.id WHERE m.id = ?1 AND m.is_deleted = 0", [id], |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))).map_err(|e| e.to_string())?;
+        let row = database.query_row("SELECT m.title, m.notebook_id, c.content_markdown, m.tags_json, c.content_text, c.content_json FROM memos m JOIN memo_contents c ON c.memo_id = m.id WHERE m.id = ?1 AND m.is_deleted = 0", [id], |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?))).map_err(|e| e.to_string())?;
         if first_notebook_id.is_none() {
             first_notebook_id = Some(row.1);
         }
@@ -1038,7 +805,7 @@ fn merge_memos(database: &Connection, params: &Value) -> Result<Value, String> {
                 titles.push(title);
             }
         }
-        markdowns.push(row.2);
+        markdowns.push(resolve_sidecar_merge_markdown(&row.2, &row.4, &row.5)?);
         let memo_tags: Vec<String> = serde_json::from_str(&row.3).unwrap_or_default();
         tags.extend(memo_tags);
     }
@@ -1050,8 +817,8 @@ fn merge_memos(database: &Connection, params: &Value) -> Result<Value, String> {
         .get("title")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned)
-        .or_else(|| titles.into_iter().find(|value| !value.starts_with("nb_")))
+        .map(|value| value.trim().to_owned())
+        .or_else(|| resolve_custom_merge_title(titles.iter().map(String::as_str)))
         .unwrap_or_default();
     tags.sort();
     tags.dedup();
@@ -1080,6 +847,59 @@ fn merge_memos(database: &Connection, params: &Value) -> Result<Value, String> {
     memo_value(database, &id, true).map(|memo| json!({ "memo": memo }))
 }
 
+fn resolve_custom_merge_title<'a>(titles: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    titles
+        .into_iter()
+        .map(str::trim)
+        .find(|title| !title.is_empty() && *title != "无标题笔记")
+        .map(str::to_owned)
+}
+
+fn resolve_sidecar_merge_markdown(
+    markdown: &str,
+    content_text: &str,
+    content_json: &str,
+) -> Result<String, String> {
+    if !markdown.trim().is_empty() {
+        return Ok(markdown.to_owned());
+    }
+
+    if !content_text.trim().is_empty() {
+        return Ok(content_text.to_owned());
+    }
+
+    let content: Value = serde_json::from_str(content_json).unwrap_or(Value::Null);
+    if sidecar_doc_has_non_text_content(&content) {
+        return Err(
+            "Source note content could not be recovered safely. Merge was cancelled.".to_owned(),
+        );
+    }
+
+    Ok(String::new())
+}
+
+fn sidecar_doc_has_non_text_content(value: &Value) -> bool {
+    let node_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+    if matches!(
+        node_type,
+        "image"
+            | "table"
+            | "codeBlock"
+            | "bulletList"
+            | "orderedList"
+            | "blockquote"
+            | "horizontalRule"
+            | "edgeeverThemeBlock"
+    ) {
+        return true;
+    }
+
+    value
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|children| children.iter().any(sidecar_doc_has_non_text_content))
+}
+
 fn list_memos(database: &Connection, params: &Value) -> Result<Value, String> {
     let trash = bool_param(params, "trash", false);
     let q = params
@@ -1088,12 +908,19 @@ fn list_memos(database: &Connection, params: &Value) -> Result<Value, String> {
         .unwrap_or("")
         .trim()
         .to_owned();
-    let notebook_id = params.get("notebookId").and_then(Value::as_str);
     let notebook_ids = params
         .get("notebookIds")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    // A notebookIds collection represents the complete notebook subtree and
+    // therefore supersedes the singular notebookId. Applying both filters
+    // would reduce the subtree back to the parent notebook alone.
+    let notebook_id = if notebook_ids.is_empty() {
+        params.get("notebookId").and_then(Value::as_str)
+    } else {
+        None
+    };
     let notebook_ids_json = Value::Array(notebook_ids).to_string();
     let filter = match params.get("filter").and_then(Value::as_str) {
         Some("pinned") => " AND m.is_pinned = 1",
@@ -1200,6 +1027,27 @@ fn create_memo(database: &Connection, params: &Value) -> Result<Value, String> {
 fn update_memo(database: &Connection, params: &Value) -> Result<Value, String> {
     let memo_id = string_param(params, "memoId")?;
     let previous = memo_value(database, &memo_id, true)?;
+    let requested_revision = params
+        .get("expectedRevision")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let requested_content_hash = params
+        .get("expectedContentHash")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    // A freshly-created desktop note changes from its local id/revision 0 to
+    // the server id/revision while the editor is still live. If an autosave
+    // was already scheduled, translate that one known local base to the exact
+    // create acknowledgement instead of misclassifying our own create as a
+    // remote edit. The marker retains both sides of the mapping, so a genuine
+    // later remote revision still conflicts normally.
+    let (expected_revision, expected_content_hash, consumed_remap_base) =
+        resolve_remapped_memo_base(
+            database,
+            &memo_id,
+            requested_revision,
+            requested_content_hash,
+        );
     let title = params
         .get("title")
         .and_then(Value::as_str)
@@ -1218,6 +1066,7 @@ fn update_memo(database: &Connection, params: &Value) -> Result<Value, String> {
     let markdown = params
         .get("contentMarkdown")
         .and_then(Value::as_str)
+        .or_else(|| previous.get("contentMarkdown").and_then(Value::as_str))
         .unwrap_or("")
         .to_owned();
     let text = params
@@ -1235,19 +1084,31 @@ fn update_memo(database: &Connection, params: &Value) -> Result<Value, String> {
     if changed == 0 {
         return Err(format!("Memo not found or deleted: {memo_id}"));
     }
-    tx.execute("UPDATE memo_contents SET content_json = ?2, content_markdown = ?3, content_text = ?4, content_hash = ?5, revision = revision + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE memo_id = ?1", rusqlite::params![memo_id, content_json_text, markdown, text, hash]).map_err(|e| e.to_string())?;
+    // `revision` is the last acknowledged cloud revision, not a counter for
+    // local autosaves. Advancing it here makes several saves on one device
+    // look newer than the cloud and produces a false revision conflict once
+    // the coalesced outbox item is synced.
+    tx.execute("UPDATE memo_contents SET content_json = ?2, content_markdown = ?3, content_text = ?4, content_hash = ?5, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE memo_id = ?1", rusqlite::params![memo_id, content_json_text, markdown, text, hash]).map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
     enqueue_change(
         database,
         "memo.update",
         &memo_id,
         &json!({
-            "memoId": memo_id, "expectedRevision": params.get("expectedRevision").and_then(Value::as_i64).unwrap_or(0),
-            "expectedContentHash": params.get("expectedContentHash").and_then(Value::as_str).unwrap_or(""),
+            "memoId": memo_id, "expectedRevision": expected_revision,
+            "expectedContentHash": expected_content_hash,
             "title": params.get("title").and_then(Value::as_str).unwrap_or(""), "contentJson": content_json,
             "contentMarkdown": markdown, "tags": tags
         }),
     )?;
+    if consumed_remap_base {
+        database
+            .execute(
+                "DELETE FROM _edgeever_sidecar_meta WHERE key = ?1",
+                [memo_remap_base_key(&memo_id)],
+            )
+            .map_err(|e| e.to_string())?;
+    }
     memo_value(database, &memo_id, true)
 }
 
@@ -1350,9 +1211,73 @@ fn sync_status(database: &Connection) -> Result<Value, String> {
     }))
 }
 
-fn prepare_sync_bootstrap(database: &Connection) -> Result<Value, String> {
+const SYNC_BOOTSTRAP_RESET_KEY: &str = "sync.bootstrap.reset_pending";
+
+fn reset_sync_mirror(database: &Connection) -> Result<(), String> {
+    let tx = database
+        .unchecked_transaction()
+        .map_err(|e| e.to_string())?;
+    tx.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS _edgeever_bootstrap_preserved_memos (id TEXT PRIMARY KEY);
+         CREATE TEMP TABLE IF NOT EXISTS _edgeever_bootstrap_preserved_notebooks (id TEXT PRIMARY KEY);
+         DELETE FROM _edgeever_bootstrap_preserved_memos;
+         DELETE FROM _edgeever_bootstrap_preserved_notebooks;
+         INSERT OR IGNORE INTO _edgeever_bootstrap_preserved_memos (id)
+         SELECT m.id FROM memos m
+         WHERE EXISTS (
+           SELECT 1 FROM _edgeever_sidecar_outbox o
+           WHERE o.entity_id = m.id OR instr(o.payload_json, m.id) > 0
+         );
+         INSERT OR IGNORE INTO _edgeever_bootstrap_preserved_notebooks (id)
+         SELECT n.id FROM notebooks n
+         WHERE EXISTS (
+           SELECT 1 FROM _edgeever_sidecar_outbox o
+           WHERE o.entity_id = n.id OR instr(o.payload_json, n.id) > 0
+         );
+         INSERT OR IGNORE INTO _edgeever_bootstrap_preserved_notebooks (id)
+         SELECT DISTINCT m.notebook_id
+         FROM memos m
+         INNER JOIN _edgeever_bootstrap_preserved_memos p ON p.id = m.id;
+         WITH RECURSIVE preserved_ancestors(id, parent_id) AS (
+           SELECT n.id, n.parent_id
+           FROM notebooks n
+           INNER JOIN _edgeever_bootstrap_preserved_notebooks p ON p.id = n.id
+           UNION
+           SELECT parent.id, parent.parent_id
+           FROM notebooks parent
+           INNER JOIN preserved_ancestors child ON child.parent_id = parent.id
+         )
+         INSERT OR IGNORE INTO _edgeever_bootstrap_preserved_notebooks (id)
+         SELECT id FROM preserved_ancestors;
+         DELETE FROM resources
+         WHERE memo_id NOT IN (SELECT id FROM _edgeever_bootstrap_preserved_memos);
+         DELETE FROM memos
+         WHERE id NOT IN (SELECT id FROM _edgeever_bootstrap_preserved_memos);
+         UPDATE notebooks SET parent_id = NULL
+         WHERE id NOT IN (SELECT id FROM _edgeever_bootstrap_preserved_notebooks);
+         DELETE FROM notebooks
+         WHERE id NOT IN (SELECT id FROM _edgeever_bootstrap_preserved_notebooks);
+         DELETE FROM _edgeever_sidecar_meta
+         WHERE key IN ('sync.cursor', 'sync.identity', 'sync.last_synced_at')
+            OR key LIKE 'memo.remap-base:%';
+         INSERT INTO _edgeever_sidecar_meta (key, value, updated_at)
+         VALUES ('sync.bootstrap.reset_pending', '1', strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at;",
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())
+}
+
+fn prepare_sync_bootstrap(database: &Connection, params: &Value) -> Result<Value, String> {
+    let reset_requested = bool_param(params, "reset", false)
+        || meta_value(database, SYNC_BOOTSTRAP_RESET_KEY).as_deref() == Some("1");
+    if reset_requested {
+        reset_sync_mirror(database)?;
+        return Ok(json!({ "clearedSeedData": false, "rebuiltMirror": true }));
+    }
+
     if meta_value(database, "sync.identity").is_some_and(|identity| !identity.is_empty()) {
-        return Ok(json!({ "clearedSeedData": false }));
+        return Ok(json!({ "clearedSeedData": false, "rebuiltMirror": false }));
     }
 
     let outbox_count = database
@@ -1377,13 +1302,11 @@ fn prepare_sync_bootstrap(database: &Connection) -> Result<Value, String> {
         .map_err(|e| e.to_string())?;
 
     if outbox_count > 0 || non_seed_memos > 0 || non_seed_notebooks > 0 {
-        return Ok(json!({ "clearedSeedData": false }));
+        return Ok(json!({ "clearedSeedData": false, "rebuiltMirror": false }));
     }
 
     let tx = database
         .unchecked_transaction()
-        .map_err(|e| e.to_string())?;
-    tx.execute("DELETE FROM memos_fts WHERE memo_id = 'memo_welcome'", [])
         .map_err(|e| e.to_string())?;
     tx.execute("DELETE FROM memos WHERE id = 'memo_welcome'", [])
         .map_err(|e| e.to_string())?;
@@ -1394,7 +1317,7 @@ fn prepare_sync_bootstrap(database: &Connection) -> Result<Value, String> {
     )
     .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
-    Ok(json!({ "clearedSeedData": true }))
+    Ok(json!({ "clearedSeedData": true, "rebuiltMirror": false }))
 }
 
 fn sync_outbox_list(database: &Connection, params: &Value) -> Result<Value, String> {
@@ -1403,12 +1326,16 @@ fn sync_outbox_list(database: &Connection, params: &Value) -> Result<Value, Stri
         .and_then(Value::as_i64)
         .unwrap_or(50)
         .clamp(1, 200);
-    let mut statement = database.prepare(
-        "SELECT id, kind, entity_id, payload_json, attempt_count, status, last_error FROM _edgeever_sidecar_outbox WHERE status IN ('pending', 'error', 'conflict') ORDER BY id LIMIT ?1",
-    ).map_err(|e| e.to_string())?;
+    let include_conflicts = bool_param(params, "includeConflicts", false);
+    let sql = if include_conflicts {
+        "SELECT id, kind, entity_id, payload_json, attempt_count, status, last_error, version FROM _edgeever_sidecar_outbox WHERE status IN ('pending', 'error', 'conflict') ORDER BY id LIMIT ?1"
+    } else {
+        "SELECT id, kind, entity_id, payload_json, attempt_count, status, last_error, version FROM _edgeever_sidecar_outbox WHERE status IN ('pending', 'error') ORDER BY id LIMIT ?1"
+    };
+    let mut statement = database.prepare(sql).map_err(|e| e.to_string())?;
     let rows = statement.query_map([limit], |row| {
         let payload: String = row.get(3)?;
-        Ok(json!({ "id": row.get::<_, i64>(0)?, "kind": row.get::<_, String>(1)?, "entityId": row.get::<_, String>(2)?, "payload": serde_json::from_str::<Value>(&payload).unwrap_or_else(|_| json!({})), "attemptCount": row.get::<_, i64>(4)?, "status": row.get::<_, String>(5)?, "lastError": row.get::<_, Option<String>>(6)? }))
+        Ok(json!({ "id": row.get::<_, i64>(0)?, "kind": row.get::<_, String>(1)?, "entityId": row.get::<_, String>(2)?, "payload": serde_json::from_str::<Value>(&payload).unwrap_or_else(|_| json!({})), "attemptCount": row.get::<_, i64>(4)?, "status": row.get::<_, String>(5)?, "lastError": row.get::<_, Option<String>>(6)?, "version": row.get::<_, i64>(7)? }))
     }).map_err(|e| e.to_string())?;
     let items: Result<Vec<_>, _> = rows.collect();
     Ok(json!({ "items": items.map_err(|e| e.to_string())? }))
@@ -1419,16 +1346,95 @@ fn sync_outbox_ack(database: &Connection, params: &Value) -> Result<Value, Strin
         .get("id")
         .and_then(Value::as_i64)
         .ok_or_else(|| "Missing outbox id".to_owned())?;
-    let (kind, entity_id): (String, String) = database
+    let (kind, entity_id, current_version): (String, String, i64) = database
         .query_row(
-            "SELECT kind, entity_id FROM _edgeever_sidecar_outbox WHERE id = ?1",
+            "SELECT kind, entity_id, version FROM _edgeever_sidecar_outbox WHERE id = ?1",
             [id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|e| e.to_string())?;
+    let requested_version = params.get("version").and_then(Value::as_i64);
+    let superseded = requested_version.is_some_and(|version| version != current_version);
     let remote_memo = params.get("remoteMemo").cloned();
     let remote_notebook = params.get("remoteNotebook").cloned();
     let remote_template = params.get("remoteTemplate").cloned();
+    let temporary_memo_base = if kind == "memo.create" {
+        memo_value(database, &entity_id, true).ok().map(|memo| {
+            (
+                memo.get("revision").and_then(Value::as_i64).unwrap_or(0),
+                memo.get("contentHash")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+            )
+        })
+    } else {
+        None
+    };
+
+    if kind == "memo.update" && superseded {
+        if let Some(remote) = remote_memo.as_ref() {
+            let remote_revision = remote.get("revision").and_then(Value::as_i64).unwrap_or(0);
+            let remote_hash = remote
+                .get("contentHash")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let payload_text: String = database
+                .query_row(
+                    "SELECT payload_json FROM _edgeever_sidecar_outbox WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            let mut payload: Value =
+                serde_json::from_str(&payload_text).unwrap_or_else(|_| json!({}));
+            payload["expectedRevision"] = json!(remote_revision);
+            payload["expectedContentHash"] = json!(remote_hash);
+            let tx = database
+                .unchecked_transaction()
+                .map_err(|e| e.to_string())?;
+            // Preserve the successor draft's content while advancing only its
+            // acknowledged cloud base. The next flush will send that draft on
+            // top of the response that just succeeded.
+            tx.execute(
+                "UPDATE memo_contents SET revision = ?1 WHERE memo_id = ?2",
+                rusqlite::params![remote_revision, entity_id],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute(
+                "UPDATE _edgeever_sidecar_outbox
+                 SET payload_json = ?1, status = 'pending', last_error = NULL,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE id = ?2",
+                rusqlite::params![payload.to_string(), id],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+        return Ok(json!({
+            "ok": true,
+            "superseded": true,
+            "memo": remote_memo,
+            "notebook": remote_notebook,
+            "template": remote_template
+        }));
+    }
+
+    if let Some(remote) = remote_memo.as_ref() {
+        let remote_id = string_param(remote, "id")?;
+        apply_sync_changes(
+            database,
+            &json!({
+                "changes": [{
+                    "entityType": "memo",
+                    "operation": "upsert",
+                    "entityId": remote_id,
+                    "memo": remote,
+                    "notebook": null
+                }]
+            }),
+        )?;
+    }
     if kind == "memo.create" || kind == "memo.merge" {
         if let Some(remote) = remote_memo.as_ref() {
             let remote_id = string_param(remote, "id")?;
@@ -1440,9 +1446,35 @@ fn sync_outbox_ack(database: &Connection, params: &Value) -> Result<Value, Strin
                 )
                 .map_err(|e| e.to_string())?;
             if remote_exists {
-                database
-                    .execute("DELETE FROM memos WHERE id = ?1", [&entity_id])
+                // The acknowledgement caches the remote memo before reconciling
+                // the local placeholder, so the remote id exists here.
+                // A merged local memo can still own resources moved from its
+                // sources. Deleting it directly is rejected by the resources
+                // foreign key and leaves both the local placeholder and remote
+                // memo visible forever. Repoint every surviving relationship
+                // before removing the placeholder, and keep the reconciliation
+                // atomic so a crash cannot strand a partially remapped merge.
+                let tx = database
+                    .unchecked_transaction()
                     .map_err(|e| e.to_string())?;
+                tx.execute(
+                    "UPDATE resources SET memo_id = ?1 WHERE memo_id = ?2",
+                    rusqlite::params![remote_id, entity_id],
+                )
+                .map_err(|e| e.to_string())?;
+                tx.execute(
+                    "UPDATE resources SET original_memo_id = ?1 WHERE original_memo_id = ?2",
+                    rusqlite::params![remote_id, entity_id],
+                )
+                .map_err(|e| e.to_string())?;
+                tx.execute(
+                    "UPDATE memos SET merged_into_memo_id = ?1 WHERE merged_into_memo_id = ?2",
+                    rusqlite::params![remote_id, entity_id],
+                )
+                .map_err(|e| e.to_string())?;
+                tx.execute("DELETE FROM memos WHERE id = ?1", [&entity_id])
+                    .map_err(|e| e.to_string())?;
+                tx.commit().map_err(|e| e.to_string())?;
             } else {
                 database
                     .execute(
@@ -1482,7 +1514,24 @@ fn sync_outbox_ack(database: &Connection, params: &Value) -> Result<Value, Strin
                 } else {
                     outbox_entity
                 };
-                database.execute("UPDATE _edgeever_sidecar_outbox SET entity_id = ?1, payload_json = ?2 WHERE id = ?3", rusqlite::params![next_entity, payload.to_string(), outbox_id]).map_err(|e| e.to_string())?;
+                database.execute("UPDATE _edgeever_sidecar_outbox SET entity_id = ?1, payload_json = ?2, version = version + 1 WHERE id = ?3", rusqlite::params![next_entity, payload.to_string(), outbox_id]).map_err(|e| e.to_string())?;
+            }
+            if kind == "memo.create" {
+                if let Some((temporary_revision, temporary_content_hash)) =
+                    temporary_memo_base.as_ref()
+                {
+                    set_meta(
+                        database,
+                        &memo_remap_base_key(&remote_id),
+                        &json!({
+                            "temporaryRevision": temporary_revision,
+                            "temporaryContentHash": temporary_content_hash,
+                            "remoteRevision": remote.get("revision").and_then(Value::as_i64).unwrap_or(0),
+                            "remoteContentHash": remote.get("contentHash").and_then(Value::as_str).unwrap_or("")
+                        })
+                        .to_string(),
+                    )?;
+                }
             }
         }
     }
@@ -1531,7 +1580,7 @@ fn sync_outbox_ack(database: &Connection, params: &Value) -> Result<Value, Strin
                 } else {
                     outbox_entity
                 };
-                database.execute("UPDATE _edgeever_sidecar_outbox SET entity_id = ?1, payload_json = ?2 WHERE id = ?3", rusqlite::params![next_entity, payload.to_string(), outbox_id]).map_err(|e| e.to_string())?;
+                database.execute("UPDATE _edgeever_sidecar_outbox SET entity_id = ?1, payload_json = ?2, version = version + 1 WHERE id = ?3", rusqlite::params![next_entity, payload.to_string(), outbox_id]).map_err(|e| e.to_string())?;
             }
         }
     }
@@ -1580,15 +1629,24 @@ fn sync_outbox_ack(database: &Connection, params: &Value) -> Result<Value, Strin
                 } else {
                     outbox_entity
                 };
-                database.execute("UPDATE _edgeever_sidecar_outbox SET entity_id = ?1, payload_json = ?2 WHERE id = ?3", rusqlite::params![next_entity, payload.to_string(), outbox_id]).map_err(|e| e.to_string())?;
+                database.execute("UPDATE _edgeever_sidecar_outbox SET entity_id = ?1, payload_json = ?2, version = version + 1 WHERE id = ?3", rusqlite::params![next_entity, payload.to_string(), outbox_id]).map_err(|e| e.to_string())?;
             }
         }
     }
-    database
-        .execute("DELETE FROM _edgeever_sidecar_outbox WHERE id = ?1", [id])
-        .map_err(|e| e.to_string())?;
+    let deleted = if let Some(version) = requested_version {
+        database
+            .execute(
+                "DELETE FROM _edgeever_sidecar_outbox WHERE id = ?1 AND version = ?2",
+                rusqlite::params![id, version],
+            )
+            .map_err(|e| e.to_string())?
+    } else {
+        database
+            .execute("DELETE FROM _edgeever_sidecar_outbox WHERE id = ?1", [id])
+            .map_err(|e| e.to_string())?
+    };
     Ok(
-        json!({ "ok": true, "memo": remote_memo, "notebook": remote_notebook, "template": remote_template }),
+        json!({ "ok": true, "superseded": deleted == 0, "memo": remote_memo, "notebook": remote_notebook, "template": remote_template }),
     )
 }
 
@@ -1606,8 +1664,12 @@ fn sync_outbox_fail(database: &Connection, params: &Value) -> Result<Value, Stri
     } else {
         "error"
     };
-    database.execute("UPDATE _edgeever_sidecar_outbox SET status = ?1, attempt_count = attempt_count + 1, last_error = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?3", rusqlite::params![status, error, id]).map_err(|e| e.to_string())?;
-    Ok(json!({ "ok": true }))
+    let updated = if let Some(version) = params.get("version").and_then(Value::as_i64) {
+        database.execute("UPDATE _edgeever_sidecar_outbox SET status = ?1, attempt_count = attempt_count + 1, last_error = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?3 AND version = ?4", rusqlite::params![status, error, id, version]).map_err(|e| e.to_string())?
+    } else {
+        database.execute("UPDATE _edgeever_sidecar_outbox SET status = ?1, attempt_count = attempt_count + 1, last_error = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?3", rusqlite::params![status, error, id]).map_err(|e| e.to_string())?
+    };
+    Ok(json!({ "ok": true, "superseded": updated == 0 }))
 }
 
 fn sync_outbox_discard(database: &Connection, params: &Value) -> Result<Value, String> {
@@ -1626,6 +1688,7 @@ fn apply_sync_changes(database: &Connection, params: &Value) -> Result<Value, St
         .get("changes")
         .and_then(Value::as_array)
         .ok_or_else(|| "Missing changes array".to_owned())?;
+    let rebuilding = meta_value(database, SYNC_BOOTSTRAP_RESET_KEY).as_deref() == Some("1");
     let tx = database
         .unchecked_transaction()
         .map_err(|e| e.to_string())?;
@@ -1633,6 +1696,23 @@ fn apply_sync_changes(database: &Connection, params: &Value) -> Result<Value, St
         let entity_type = string_param(change, "entityType")?;
         let operation = string_param(change, "operation")?;
         let entity_id = string_param(change, "entityId")?;
+        if rebuilding {
+            let preserved_table = if entity_type == "notebook" {
+                "_edgeever_bootstrap_preserved_notebooks"
+            } else {
+                "_edgeever_bootstrap_preserved_memos"
+            };
+            let preserved = tx
+                .query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM {preserved_table} WHERE id = ?1)"),
+                    [&entity_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap_or(false);
+            if preserved {
+                continue;
+            }
+        }
         if entity_type == "notebook" {
             if operation == "delete" {
                 tx.execute("UPDATE notebooks SET is_deleted = 1, deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1", [&entity_id]).map_err(|e| e.to_string())?;
@@ -1695,7 +1775,7 @@ fn handle(
         "storage.backups" => list_backups(root).map_err(|error| error.to_string()),
         "storage.restore" => restore_database(database, root, migrations, &request.params),
         "sync.status" => sync_status(database),
-        "sync.bootstrap.prepare" => prepare_sync_bootstrap(database),
+        "sync.bootstrap.prepare" => prepare_sync_bootstrap(database, &request.params),
         "sync.outbox.list" => sync_outbox_list(database, &request.params),
         "sync.outbox.ack" => sync_outbox_ack(database, &request.params),
         "sync.outbox.fail" => sync_outbox_fail(database, &request.params),
@@ -1722,6 +1802,18 @@ fn handle(
                     .unwrap_or(""),
             )?;
             set_meta(database, "sync.last_synced_at", &chrono_like_now())?;
+            database
+                .execute(
+                    "DELETE FROM _edgeever_sidecar_meta WHERE key = ?1",
+                    [SYNC_BOOTSTRAP_RESET_KEY],
+                )
+                .map_err(|e| e.to_string())?;
+            database
+                .execute_batch(
+                    "DROP TABLE IF EXISTS temp._edgeever_bootstrap_preserved_memos;
+                     DROP TABLE IF EXISTS temp._edgeever_bootstrap_preserved_notebooks;",
+                )
+                .map_err(|e| e.to_string())?;
             Ok(json!({ "ok": true }))
         }
         "notebook.list" => list_notebooks(database),
@@ -1741,6 +1833,7 @@ fn handle(
         "template.delete" => delete_template(database, &request.params),
         "resource.list" => list_resources(database, &request.params),
         "resource.cache" => cache_resource(database, &request.params),
+        "resource.delete" => delete_cached_resource(database, &request.params),
         "tag.list" => list_tags(database),
         "tag.rename" => rewrite_tag(database, &request.params, false),
         "tag.delete" => rewrite_tag(database, &request.params, true),
@@ -1836,5 +1929,128 @@ mod tests {
         let first = content_hash("same", &json);
         assert_eq!(first, content_hash("same", &json));
         assert_ne!(first, content_hash("different", &json));
+    }
+
+    #[test]
+    fn merge_title_skips_untitled_sources() {
+        assert_eq!(
+            resolve_custom_merge_title(["无标题笔记", "  手动标题  ", "另一个标题"]),
+            Some("手动标题".to_owned())
+        );
+        assert_eq!(resolve_custom_merge_title(["无标题笔记", "  "]), None);
+    }
+
+    #[test]
+    fn merge_content_falls_back_to_stored_text_when_markdown_is_empty() {
+        assert_eq!(
+            resolve_sidecar_merge_markdown("", "正文仍然存在", r#"{"type":"doc","content":[]}"#)
+                .unwrap(),
+            "正文仍然存在"
+        );
+        assert_eq!(
+            resolve_sidecar_merge_markdown(
+                "**保留格式**",
+                "保留格式",
+                r#"{"type":"doc","content":[]}"#
+            )
+            .unwrap(),
+            "**保留格式**"
+        );
+        assert!(resolve_sidecar_merge_markdown(
+            "",
+            "",
+            r#"{"type":"doc","content":[{"type":"image","attrs":{"src":"image.png"}}]}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn mirror_reset_removes_stale_cache_and_preserves_outbox_drafts() {
+        let database = Connection::open_in_memory().unwrap();
+        database
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE _edgeever_sidecar_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+                 CREATE TABLE _edgeever_sidecar_outbox (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, entity_id TEXT NOT NULL, payload_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending');
+                 CREATE TABLE notebooks (id TEXT PRIMARY KEY, parent_id TEXT REFERENCES notebooks(id) ON DELETE RESTRICT, name TEXT NOT NULL);
+                 CREATE TABLE memos (id TEXT PRIMARY KEY, notebook_id TEXT NOT NULL REFERENCES notebooks(id) ON DELETE RESTRICT, title TEXT);
+                 CREATE TABLE memo_contents (memo_id TEXT PRIMARY KEY REFERENCES memos(id) ON DELETE CASCADE, content_markdown TEXT NOT NULL);
+                 CREATE TABLE resources (id TEXT PRIMARY KEY, memo_id TEXT NOT NULL REFERENCES memos(id) ON DELETE RESTRICT);
+                 INSERT INTO _edgeever_sidecar_meta VALUES ('sync.cursor', '42', 'now'), ('sync.identity', 'workspace-a', 'now');
+                 INSERT INTO notebooks VALUES ('stale-notebook', NULL, 'Stale'), ('draft-parent', NULL, 'Draft parent'), ('draft-notebook', 'draft-parent', 'Draft');
+                 INSERT INTO memos VALUES ('stale-memo', 'stale-notebook', 'Stale cache'), ('draft-memo', 'draft-notebook', 'Unsynced draft');
+                 INSERT INTO memo_contents VALUES ('stale-memo', 'stale'), ('draft-memo', 'local changes');
+                 INSERT INTO resources VALUES ('stale-resource', 'stale-memo'), ('draft-resource', 'draft-memo');
+                 INSERT INTO _edgeever_sidecar_outbox (id, kind, entity_id, payload_json) VALUES (1, 'memo.update', 'draft-memo', '{\"memoId\":\"draft-memo\"}');",
+            )
+            .unwrap();
+
+        let result = prepare_sync_bootstrap(&database, &json!({ "reset": true })).unwrap();
+        assert_eq!(
+            result.get("rebuiltMirror").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            database
+                .query_row(
+                    "SELECT COUNT(*) FROM memos WHERE id = 'stale-memo'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            database
+                .query_row(
+                    "SELECT content_markdown FROM memo_contents WHERE memo_id = 'draft-memo'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "local changes"
+        );
+        assert_eq!(
+            database
+                .query_row(
+                    "SELECT COUNT(*) FROM notebooks WHERE id IN ('draft-parent', 'draft-notebook')",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            database
+                .query_row(
+                    "SELECT COUNT(*) FROM resources WHERE id = 'draft-resource'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert!(meta_value(&database, "sync.cursor").is_none());
+
+        apply_sync_changes(
+            &database,
+            &json!({ "changes": [{
+                "entityType": "memo",
+                "operation": "upsert",
+                "entityId": "draft-memo",
+                "memo": { "title": "Cloud snapshot must not overwrite this" }
+            }] }),
+        )
+        .unwrap();
+        assert_eq!(
+            database
+                .query_row(
+                    "SELECT title FROM memos WHERE id = 'draft-memo'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "Unsynced draft"
+        );
     }
 }

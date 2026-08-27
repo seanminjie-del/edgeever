@@ -1,17 +1,18 @@
-import { app, BrowserWindow, Menu, Tray, nativeImage, ipcMain, session, net, protocol, shell, dialog, safeStorage } from "electron";
+import { app, BrowserWindow, Menu, Tray, nativeImage, ipcMain, session, net, protocol, shell, dialog, safeStorage, clipboard, powerMonitor } from "electron";
 import { existsSync } from "node:fs";
 import { appendFile, mkdir, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { execFile, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { release as operatingSystemRelease } from "node:os";
 import { SidecarRpcClient } from "./rpc.mjs";
 import { resourceRequestHeaders } from "./resource-request.mjs";
-import { isSafeResourceId, resourceIdFromRequest } from "./resource-url.mjs";
+import { cachedResourceResponse, isSafeResourceId, resourceIdFromRequest } from "./resource-url.mjs";
 import { isSupportedAssociatedFile } from "./file-association.mjs";
 import { accountDataDirectory, accountScopeKey } from "./account-scope.mjs";
 import { rotateDiagnosticLog } from "./diagnostic-log.mjs";
 import { restrictDirectory, restrictFile } from "./file-permissions.mjs";
-import { normalizeStagedResourceInput } from "./staged-resource.mjs";
+import { normalizeStagedResourceInput, remapStagedResourceMetadata } from "./staged-resource.mjs";
 import {
   isMountedDiskImageVolume,
   isMountedInstallerPath,
@@ -21,6 +22,9 @@ import { userDataDirectoryFromArguments } from "./user-data-directory.mjs";
 import { isAllowedPrintPreviewUrl } from "./window-open-policy.mjs";
 import { showWindow } from "./window-visibility.mjs";
 import { trayIconPath } from "./tray-icon.mjs";
+import { writeRichClipboard } from "./clipboard-write.mjs";
+import { LocalDataResetError, scheduleMacLocalDataReset } from "./local-data-reset.mjs";
+import { buildDesktopDiagnosticIssueUrl, normalizeDesktopDiagnostic } from "./desktop-diagnostics.mjs";
 import electronUpdater from "electron-updater";
 
 const { autoUpdater } = electronUpdater;
@@ -30,6 +34,29 @@ if (requestedUserDataDirectory) app.setPath("userData", requestedUserDataDirecto
 
 const currentDirectory = fileURLToPath(new URL(".", import.meta.url));
 const projectRoot = join(currentDirectory, "../../..");
+/**
+ * Force Dock to use our multi-resolution app icon. Bundle Info.plist is still
+ * the primary source; this covers cases where Launch Services/Dock cache a
+ * blank tile after overwrite installs.
+ */
+const applyMacDockIcon = () => {
+  if (process.platform !== "darwin" || !app.dock) return;
+  const candidates = app.isPackaged
+    ? [join(process.resourcesPath, "icon.icns"), join(process.resourcesPath, "icon.png")]
+    : [
+        join(projectRoot, "apps/desktop/assets/icon.icns"),
+        join(projectRoot, "apps/desktop/assets/icon.png"),
+        join(projectRoot, "apps/web/public/pwa-512x512.png"),
+      ];
+  for (const iconPath of candidates) {
+    if (!existsSync(iconPath)) continue;
+    const image = nativeImage.createFromPath(iconPath);
+    if (!image.isEmpty()) {
+      app.dock.setIcon(image);
+      return;
+    }
+  }
+};
 const webUrl = process.env.EDGE_EVER_DESKTOP_WEB_URL || "http://127.0.0.1:5173";
 // A packaged desktop app is self-hosted-client software: its instance URL must
 // come from the user-facing first-run setup, never from the build environment.
@@ -49,12 +76,22 @@ let sidecar;
 let tray;
 let isQuitting = false;
 let updateState = "idle";
+let updateCheckInFlight = null;
+let updateDownloadInFlight = null;
+let updateCheckTimer = null;
+let lastUpdateCheckAt = 0;
+let downloadedUpdateVersion = null;
+let promptedUpdateVersion = null;
 let sidecarScopeKey = "anonymous";
 let activeAccountId = null;
 let shutdownCleanupStarted = false;
 let sidecarRestartTimer = null;
 let sidecarRestartAttempts = 0;
 let sidecarRestartInFlight = false;
+let localDataResetScheduled = false;
+let rendererCrashDialogOpen = false;
+const updateCheckIntervalMs = 60 * 60 * 1_000;
+const updateCheckFocusThrottleMs = 15 * 60 * 1_000;
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 const windowStatePath = () => join(app.getPath("userData"), "window-state.json");
 const instanceUrlPath = () => join(app.getPath("userData"), "instance-url");
@@ -104,6 +141,73 @@ const writeDiagnostic = async (event, details = {}) => {
     await restrictFile(path);
   } catch {
     // Diagnostics must never prevent the desktop app from starting or quitting.
+  }
+};
+
+const desktopDiagnosticSystemInfo = async () => {
+  let gpu = "unknown";
+  let gpuFeatures = "unknown";
+  try {
+    const gpuInfo = await app.getGPUInfo("basic");
+    gpu = (gpuInfo.gpuDevice || []).map((device) => [
+      device.active === true ? "active" : "inactive",
+      device.deviceString,
+      device.vendorId,
+      device.deviceId,
+      device.driverVendor,
+      device.driverVersion,
+    ].filter((value) => value !== undefined && value !== "").join(":"))
+      .join(", ") || "unknown";
+  } catch {
+    // GPU diagnostics are useful but must never block issue reporting.
+  }
+  try {
+    gpuFeatures = Object.entries(app.getGPUFeatureStatus()).map(([name, status]) => `${name}=${status}`).join(", ");
+  } catch {
+    // Some renderer failures can also make GPU feature inspection unavailable.
+  }
+  return {
+    appVersion: app.getVersion(),
+    platform: process.platform,
+    architecture: process.arch,
+    osVersion: process.getSystemVersion?.() || "unknown",
+    osRelease: operatingSystemRelease(),
+    electron: process.versions.electron || "unknown",
+    chrome: process.versions.chrome || "unknown",
+    gpu,
+    gpuFeatures,
+  };
+};
+
+const openDesktopDiagnosticIssue = async (details) => {
+  const diagnostic = normalizeDesktopDiagnostic(details);
+  await writeDiagnostic("renderer.issue-opened", diagnostic);
+  await shell.openExternal(buildDesktopDiagnosticIssueUrl({
+    diagnostic,
+    systemInfo: await desktopDiagnosticSystemInfo(),
+  }));
+};
+
+const handleRendererProcessGone = async (details) => {
+  if (isQuitting || details.reason === "clean-exit" || rendererCrashDialogOpen) return;
+  rendererCrashDialogOpen = true;
+  const isChinese = app.getLocale().toLowerCase().startsWith("zh");
+  try {
+    const result = await dialog.showMessageBox(mainWindow, {
+      type: "error",
+      title: isChinese ? "EdgeEver 页面意外停止" : "EdgeEver page stopped unexpectedly",
+      message: isChinese ? "问题已记录，可以重新加载页面继续使用。" : "The problem was recorded. You can reload the page to continue.",
+      detail: isChinese
+        ? "如需反馈，可先检查 EdgeEver 自动生成并脱敏的公开 GitHub Issue，再决定是否提交。"
+        : "To report it, review the redacted public GitHub Issue generated by EdgeEver before submitting.",
+      buttons: isChinese ? ["报告到 GitHub", "重新加载", "关闭"] : ["Report to GitHub", "Reload", "Close"],
+      defaultId: 1,
+      cancelId: 2,
+    });
+    if (result.response === 0) await openDesktopDiagnosticIssue({ kind: "renderer-process-gone", ...details });
+    if (result.response === 0 || result.response === 1) mainWindow?.webContents.reload();
+  } finally {
+    rendererCrashDialogOpen = false;
   }
 };
 
@@ -301,8 +405,8 @@ const buildApplicationMenu = () => {
     {
       label: "View",
       submenu: [
-        { label: "Focus Search", accelerator: "CmdOrCtrl+K", click: () => sendDesktopCommand("focus-search") },
-        { label: "Toggle Focus Mode", accelerator: "CmdOrCtrl+Shift+F", click: () => sendDesktopCommand("toggle-focus-mode") },
+        { label: "Focus Search", accelerator: "CmdOrCtrl+Shift+F", click: () => sendDesktopCommand("focus-search") },
+        { label: "Toggle Focus Mode", click: () => sendDesktopCommand("toggle-focus-mode") },
         { type: "separator" },
         { role: "togglefullscreen" }, { role: "resetZoom" }, { role: "zoomIn" }, { role: "zoomOut" },
       ],
@@ -330,8 +434,7 @@ const createTray = () => {
     { label: "Show EdgeEver", click: () => showWindow(mainWindow) },
     { label: "Sync now", click: () => sendDesktopCommand("sync-now") },
     { label: "Backup now", click: () => sendDesktopCommand("backup-now") },
-    ...(updateState === "available" ? [{ label: "Download update", click: () => void autoUpdater.downloadUpdate() }] : []),
-    ...(updateState === "downloaded" ? [{ label: "Restart to update", click: () => autoUpdater.quitAndInstall() }] : []),
+    ...(updateState === "downloaded" ? [{ label: "Restart to update", click: () => installDownloadedUpdate() }] : []),
     { type: "separator" },
     { label: "Quit EdgeEver", click: () => { isQuitting = true; app.quit(); } },
   ]));
@@ -351,7 +454,7 @@ const registerResourceProtocol = () => {
       const bytes = await readFile(bytesPath);
       let metadata = {};
       try { metadata = JSON.parse(await readFile(metadataPath, "utf8")); } catch {}
-      return new Response(bytes, { headers: { "Content-Type": metadata.contentType || "application/octet-stream", "Cache-Control": "no-store" } });
+      return cachedResourceResponse(bytes, metadata.contentType, request.headers.get("range"));
     } catch {
       // Fall through to the instance while online, then persist the response.
     }
@@ -361,16 +464,30 @@ const registerResourceProtocol = () => {
     try {
       const cookies = await session.defaultSession.cookies.get({ url: sourceUrl });
       const headers = resourceRequestHeaders({ cookies, sessionToken: desktopSessionToken });
+      const rangeHeader = request.headers.get("range");
+      if (rangeHeader) headers.set("range", rangeHeader);
       const response = await net.fetch(sourceUrl, { headers });
       if (!response.ok) return new Response("Resource request failed", { status: response.status });
       const body = Buffer.from(await response.arrayBuffer());
+      if (response.status === 206) {
+        const responseHeaders = new Headers({
+          "Accept-Ranges": response.headers.get("accept-ranges") || "bytes",
+          "Cache-Control": "no-store",
+          "Content-Type": response.headers.get("content-type") || "application/octet-stream",
+        });
+        for (const name of ["content-length", "content-range", "etag", "last-modified"]) {
+          const value = response.headers.get(name);
+          if (value) responseHeaders.set(name, value);
+        }
+        return new Response(body, { status: 206, headers: responseHeaders });
+      }
       await mkdir(directory, { recursive: true });
       await restrictDirectory(directory);
       await writeFile(bytesPath, body, { mode: 0o600 });
       await writeFile(metadataPath, JSON.stringify({ contentType: response.headers.get("content-type") || "application/octet-stream" }), { mode: 0o600 });
       await restrictFile(bytesPath);
       await restrictFile(metadataPath);
-      return new Response(body, { headers: { "Content-Type": response.headers.get("content-type") || "application/octet-stream", "Cache-Control": "no-store" } });
+      return cachedResourceResponse(body, response.headers.get("content-type"), null);
     } catch (error) {
       void writeDiagnostic("resource.cache-failed", { resourceId, message: error.message });
       return new Response("Resource unavailable", { status: 504 });
@@ -404,15 +521,134 @@ const refreshTrayMenu = () => {
   createTray();
 };
 
+const desktopUpdateStatus = () => ({
+  state: updateState,
+  version: downloadedUpdateVersion,
+});
+
+const publishDesktopUpdateStatus = () => {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send("desktop:update-status-changed", desktopUpdateStatus());
+};
+
+const installDownloadedUpdate = () => {
+  if (updateState !== "downloaded") return { started: false };
+  // The normal window close handler hides the app. Mark this as a real quit
+  // before electron-updater closes windows so installation can proceed.
+  isQuitting = true;
+  autoUpdater.quitAndInstall(false, true);
+  return { started: true };
+};
+
+const promptForDownloadedUpdate = async (version) => {
+  const promptKey = version || "unknown";
+  if (isQuitting || promptedUpdateVersion === promptKey) return;
+  promptedUpdateVersion = promptKey;
+  showWindow(mainWindow);
+  const isChinese = app.getLocale().toLowerCase().startsWith("zh");
+  const result = await dialog.showMessageBox(mainWindow, {
+    type: "info",
+    title: isChinese ? "EdgeEver 更新已就绪" : "EdgeEver update ready",
+    message: isChinese
+      ? `EdgeEver v${version || "最新版"} 已下载完成。`
+      : `EdgeEver v${version || "latest"} has been downloaded.`,
+    detail: isChinese
+      ? "现在重启即可完成安装。也可以选择稍后，EdgeEver 会在您退出应用时自动安装。"
+      : "Restart now to finish installing it. You can also choose Later; EdgeEver will install it automatically when you quit the app.",
+    buttons: [isChinese ? "重启以更新" : "Restart to Update", isChinese ? "稍后" : "Later"],
+    defaultId: 0,
+    cancelId: 1,
+    noLink: true,
+  });
+  if (result.response === 0) {
+    void writeDiagnostic("update.install-confirmed", { version });
+    installDownloadedUpdate();
+  } else {
+    void writeDiagnostic("update.install-deferred", { version });
+  }
+};
+
+const checkForDesktopUpdate = (reason, { force = false, throwOnError = false } = {}) => {
+  if (!app.isPackaged || process.env.EDGE_EVER_DISABLE_AUTO_UPDATE === "1" || updateState === "downloaded") {
+    return Promise.resolve(null);
+  }
+  if (updateCheckInFlight) {
+    return throwOnError ? updateCheckInFlight : updateCheckInFlight.catch(() => null);
+  }
+  if (updateDownloadInFlight) return Promise.resolve(null);
+  const now = Date.now();
+  if (!force && now - lastUpdateCheckAt < updateCheckFocusThrottleMs) return Promise.resolve(null);
+  lastUpdateCheckAt = now;
+  void writeDiagnostic("update.check-started", { reason });
+  updateCheckInFlight = autoUpdater.checkForUpdates()
+    .then((result) => {
+      if (result?.downloadPromise) {
+        updateDownloadInFlight = result.downloadPromise
+          .catch(async (error) => {
+            updateState = "idle";
+            refreshTrayMenu();
+            await writeDiagnostic("update.download-failed", { reason, message: error.message });
+          })
+          .finally(() => { updateDownloadInFlight = null; });
+      }
+      return result;
+    })
+    .catch(async (error) => {
+      await writeDiagnostic("update.check-failed", { reason, message: error.message });
+      throw error;
+    })
+    .finally(() => { updateCheckInFlight = null; });
+  return throwOnError ? updateCheckInFlight : updateCheckInFlight.catch(() => null);
+};
+
 const configureAutoUpdater = () => {
   if (!app.isPackaged || process.env.EDGE_EVER_DISABLE_AUTO_UPDATE === "1") return;
-  autoUpdater.autoDownload = false;
+  autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
-  autoUpdater.on("update-available", () => { updateState = "available"; refreshTrayMenu(); void writeDiagnostic("update.available"); });
+  autoUpdater.autoRunAppAfterInstall = true;
+  autoUpdater.on("update-available", (info) => {
+    updateState = "available";
+    downloadedUpdateVersion = info?.version || null;
+    refreshTrayMenu();
+    publishDesktopUpdateStatus();
+    void writeDiagnostic("update.available", { version: info?.version });
+  });
+  autoUpdater.on("update-not-available", () => {
+    updateState = "idle";
+    downloadedUpdateVersion = null;
+    refreshTrayMenu();
+    publishDesktopUpdateStatus();
+    void writeDiagnostic("update.not-available");
+  });
   autoUpdater.on("download-progress", (progress) => { void writeDiagnostic("update.download-progress", { percent: progress.percent }); });
-  autoUpdater.on("update-downloaded", () => { updateState = "downloaded"; refreshTrayMenu(); void writeDiagnostic("update.downloaded"); });
-  autoUpdater.on("error", (error) => { void writeDiagnostic("update.error", { message: error.message }); });
-  void autoUpdater.checkForUpdates().catch((error) => writeDiagnostic("update.check-failed", { message: error.message }));
+  autoUpdater.on("update-downloaded", (info) => {
+    updateState = "downloaded";
+    downloadedUpdateVersion = info?.version || downloadedUpdateVersion;
+    refreshTrayMenu();
+    publishDesktopUpdateStatus();
+    void writeDiagnostic("update.downloaded", { version: downloadedUpdateVersion });
+    void promptForDownloadedUpdate(downloadedUpdateVersion).catch((error) => {
+      promptedUpdateVersion = null;
+      void writeDiagnostic("update.prompt-failed", { message: error.message });
+    });
+  });
+  autoUpdater.on("error", (error) => {
+    isQuitting = false;
+    if (updateState !== "downloaded") {
+      updateState = "idle";
+      downloadedUpdateVersion = null;
+    }
+    refreshTrayMenu();
+    publishDesktopUpdateStatus();
+    void writeDiagnostic("update.error", { message: error.message });
+  });
+  void checkForDesktopUpdate("startup", { force: true });
+  updateCheckTimer = setInterval(() => {
+    void checkForDesktopUpdate("interval", { force: true });
+  }, updateCheckIntervalMs);
+  powerMonitor.on("resume", () => {
+    void checkForDesktopUpdate("resume", { force: true });
+  });
 };
 
 const startSidecar = async (accountId = null) => {
@@ -510,10 +746,53 @@ const createWindow = async () => {
     }
   });
 
-  if (app.isPackaged && !process.env.EDGE_EVER_DESKTOP_WEB_URL) {
-    await mainWindow.loadFile(join(process.resourcesPath, "web/index.html"));
-  } else {
-    await mainWindow.loadURL(webUrl);
+  // Install startup diagnostics before navigation. A renderer exception can
+  // happen while loadFile/loadURL is still resolving, so listeners registered
+  // afterwards miss the only useful evidence and leave users with a blank
+  // window and an empty diagnostic log.
+  mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    void writeDiagnostic("renderer.load-failed", {
+      errorCode,
+      errorDescription,
+      validatedURL,
+      isMainFrame,
+    });
+  });
+  mainWindow.webContents.on("preload-error", (_event, preloadPath, error) => {
+    void writeDiagnostic("renderer.preload-error", {
+      preloadPath,
+      message: String(error?.message || error).slice(0, 2000),
+    });
+  });
+  mainWindow.webContents.on("console-message", (details) => {
+    if (details.level !== "error") return;
+    void writeDiagnostic("renderer.console-error", {
+      message: String(details.message || "").slice(0, 2000),
+      lineNumber: details.lineNumber,
+      sourceId: String(details.sourceId || "").slice(0, 1000),
+    });
+  });
+  mainWindow.webContents.on("did-finish-load", () => {
+    void writeDiagnostic("renderer.loaded", { url: mainWindow?.webContents.getURL() || "" });
+  });
+  mainWindow.webContents.on("render-process-gone", (_event, details) => {
+    void writeDiagnostic("renderer.gone", details);
+    void handleRendererProcessGone(details);
+  });
+  mainWindow.webContents.on("unresponsive", () => { void writeDiagnostic("renderer.unresponsive"); });
+  mainWindow.webContents.on("responsive", () => { void writeDiagnostic("renderer.responsive"); });
+
+  try {
+    if (app.isPackaged && !process.env.EDGE_EVER_DESKTOP_WEB_URL) {
+      await mainWindow.loadFile(join(process.resourcesPath, "web/index.html"));
+    } else {
+      await mainWindow.loadURL(webUrl);
+    }
+  } catch (error) {
+    void writeDiagnostic("renderer.navigation-rejected", {
+      message: String(error?.message || error).slice(0, 2000),
+    });
+    throw error;
   }
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (url.startsWith("edgeever-resource://") || url.startsWith("edgeever-staged://")) return { action: "allow" };
@@ -532,11 +811,6 @@ const createWindow = async () => {
     if (url.startsWith("https://") || url.startsWith("http://")) void shell.openExternal(url);
     return { action: "deny" };
   });
-  mainWindow.webContents.on("render-process-gone", (_event, details) => {
-    void writeDiagnostic("renderer.gone", details);
-  });
-  mainWindow.webContents.on("unresponsive", () => { void writeDiagnostic("renderer.unresponsive"); });
-  mainWindow.webContents.on("responsive", () => { void writeDiagnostic("renderer.responsive"); });
   mainWindow.webContents.on("will-navigate", (event, url) => {
     if (url.startsWith(webUrl) || url.startsWith("edgeever-resource://") || url.startsWith("edgeever-staged://")) return;
     event.preventDefault();
@@ -564,6 +838,7 @@ const confirmMacInstallation = async () => {
 };
 
 app.whenReady().then(async () => {
+  applyMacDockIcon();
   if (app.isPackaged && isMountedInstallerPath(app.getAppPath())) {
     const isChinese = app.getLocale().toLowerCase().startsWith("zh");
     const result = await dialog.showMessageBox({
@@ -617,9 +892,20 @@ app.whenReady().then(async () => {
   await startSidecar();
   createTray();
 
+  ipcMain.on("desktop:local-data-reset-available-sync", (event) => {
+    event.returnValue = process.platform === "darwin" && app.isPackaged && !requestedUserDataDirectory;
+  });
   ipcMain.handle("desktop:sidecar-request", async (_event, method, params) => {
     if (!sidecar) throw new Error("EdgeEver sidecar is unavailable");
-    return sidecar.request(method, params);
+    const result = await sidecar.request(method, params);
+    if (method === "resource.delete" && isSafeResourceId(params?.resourceId)) {
+      const directory = resourceCacheDirectory();
+      await Promise.all([
+        unlink(join(directory, `${params.resourceId}.bin`)).catch(() => {}),
+        unlink(join(directory, `${params.resourceId}.json`)).catch(() => {}),
+      ]);
+    }
+    return result;
   });
   ipcMain.handle("desktop:sidecar-status", () => ({ available: Boolean(sidecar), path: sidecarPath, scope: sidecarScopeKey }));
   ipcMain.handle("desktop:set-account-scope", async (_event, accountId) => {
@@ -643,6 +929,12 @@ app.whenReady().then(async () => {
   });
   ipcMain.on("desktop:api-base-url-sync", (event) => { event.returnValue = configuredApiBaseUrl; });
   ipcMain.on("desktop:session-token-sync", (event) => { event.returnValue = desktopSessionToken; });
+  ipcMain.handle("desktop:copy-text", (_event, value) => {
+    if (typeof value !== "string") throw new Error("Clipboard value must be a string");
+    clipboard.writeText(value);
+    return clipboard.readText() === value;
+  });
+  ipcMain.handle("desktop:copy-html", (_event, input) => writeRichClipboard(clipboard, input));
   ipcMain.handle("desktop:set-session-token", async (_event, value) => {
     await saveDesktopSessionToken(value);
     return { stored: Boolean(desktopSessionToken) };
@@ -650,6 +942,80 @@ app.whenReady().then(async () => {
   ipcMain.handle("desktop:clear-session-token", async () => {
     await saveDesktopSessionToken("");
     return { stored: false };
+  });
+  ipcMain.handle("desktop:record-renderer-error", async (event, details) => {
+    if (event.sender !== mainWindow?.webContents) throw new Error("Renderer diagnostics must come from the main window");
+    await writeDiagnostic("renderer.react-error", normalizeDesktopDiagnostic(details));
+    return { recorded: true };
+  });
+  ipcMain.handle("desktop:open-renderer-issue", async (event, details) => {
+    if (event.sender !== mainWindow?.webContents) throw new Error("Renderer issue reports must come from the main window");
+    await openDesktopDiagnosticIssue(details);
+    return { opened: true };
+  });
+  ipcMain.handle("desktop:clear-local-data", async (event) => {
+    if (event.sender !== mainWindow?.webContents) throw new Error("Local data reset must come from the main window");
+    if (process.platform !== "darwin" || !app.isPackaged) throw new Error("Local data reset is only available in the packaged macOS app");
+    if (requestedUserDataDirectory) throw new Error("Local data reset is unavailable with a custom user-data directory");
+    if (localDataResetScheduled) return { scheduled: true };
+
+    try {
+      await scheduleMacLocalDataReset({
+        appDataDirectory: app.getPath("appData"),
+        executablePath: app.getPath("exe"),
+        parentPid: process.pid,
+        userDataDirectory: app.getPath("userData"),
+      });
+    } catch (error) {
+      await writeDiagnostic("local-data-reset.schedule-failed", {
+        code: error instanceof LocalDataResetError ? error.code : "unexpected",
+        message: error instanceof Error ? error.message : String(error),
+        cause: error instanceof LocalDataResetError && error.cause instanceof Error ? error.cause.message : undefined,
+      });
+      return {
+        scheduled: false,
+        errorCode: error instanceof LocalDataResetError ? error.code : "unexpected",
+      };
+    }
+
+    // Only begin shutting down once the detached reset helper has definitely
+    // started. From this point on, exiting lets that helper remove userData and
+    // relaunch the app, so non-critical cleanup failures must not strand the
+    // application in a half-stopped state.
+    localDataResetScheduled = true;
+    isQuitting = true;
+    shutdownCleanupStarted = true;
+    const forcedExitTimer = setTimeout(() => app.exit(0), 5000);
+    forcedExitTimer.unref();
+    if (sidecarRestartTimer) {
+      clearTimeout(sidecarRestartTimer);
+      sidecarRestartTimer = null;
+    }
+    try {
+      tray?.destroy();
+      tray = null;
+    } catch (error) {
+      void writeDiagnostic("local-data-reset.tray-cleanup-failed", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+    await stopSidecar().catch((error) => writeDiagnostic("local-data-reset.sidecar-stop-failed", {
+      message: error instanceof Error ? error.message : String(error),
+    }));
+    const storageResults = await Promise.allSettled([
+      Promise.resolve().then(() => session.defaultSession.clearStorageData()),
+      Promise.resolve().then(() => session.defaultSession.clearCache()),
+    ]);
+    const storageFailure = storageResults.find((result) => result.status === "rejected");
+    if (storageFailure) {
+      void writeDiagnostic("local-data-reset.storage-cleanup-failed", {
+        message: storageFailure.reason instanceof Error ? storageFailure.reason.message : String(storageFailure.reason),
+      });
+    }
+
+    clearTimeout(forcedExitTimer);
+    setTimeout(() => app.exit(0), 50).unref();
+    return { scheduled: true };
   });
   ipcMain.handle("desktop:set-api-base-url", async (_event, value) => {
     const normalized = typeof value === "string" ? value.trim().replace(/\/$/, "") : "";
@@ -669,9 +1035,13 @@ app.whenReady().then(async () => {
     }
     return configuredApiBaseUrl;
   });
-  ipcMain.handle("desktop:update-status", () => ({ state: updateState }));
+  ipcMain.handle("desktop:update-status", () => desktopUpdateStatus());
+  ipcMain.handle("desktop:check-update", async () => {
+    await checkForDesktopUpdate("manual", { force: true, throwOnError: true });
+    return desktopUpdateStatus();
+  });
   ipcMain.handle("desktop:download-update", () => autoUpdater.downloadUpdate());
-  ipcMain.handle("desktop:install-update", () => autoUpdater.quitAndInstall());
+  ipcMain.handle("desktop:install-update", () => installDownloadedUpdate());
   ipcMain.handle("desktop:stage-resource", async (_event, input) => {
     const { memoId, name, type, bytes } = normalizeStagedResourceInput(input);
     const id = `stage_${Date.now()}_${Math.random().toString(36).slice(2)}`;
@@ -696,6 +1066,25 @@ app.whenReady().then(async () => {
       try { result.push(JSON.parse(await readFile(join(directory, name), "utf8"))); } catch {}
     }
     return result;
+  });
+  ipcMain.handle("desktop:remap-staged-resource-memo-ids", async (_event, mappings) => {
+    if (!Array.isArray(mappings) || mappings.length === 0) return { updated: 0 };
+    const directory = stagedResourceDirectory();
+    try { await mkdir(directory, { recursive: true }); await restrictDirectory(directory); } catch {}
+    const names = await readdir(directory);
+    let updated = 0;
+    for (const name of names.filter((value) => value.endsWith(".json"))) {
+      const metadataPath = join(directory, name);
+      try {
+        const metadata = JSON.parse(await readFile(metadataPath, "utf8"));
+        const remapped = remapStagedResourceMetadata(metadata, mappings);
+        if (remapped === metadata) continue;
+        await writeFile(metadataPath, JSON.stringify(remapped), { mode: 0o600 });
+        await restrictFile(metadataPath);
+        updated += 1;
+      } catch {}
+    }
+    return { updated };
   });
   ipcMain.handle("desktop:read-staged-resource", async (_event, id) => {
     if (!isSafeResourceId(id)) throw new Error("Invalid staged resource id");
@@ -723,6 +1112,7 @@ app.whenReady().then(async () => {
   handleOpenTarget(process.argv);
   app.on("activate", () => {
     if (!showWindow(mainWindow)) void createWindow();
+    void checkForDesktopUpdate("activate");
   });
 });
 
@@ -748,6 +1138,10 @@ app.on("before-quit", (event) => {
   if (sidecarRestartTimer) {
     clearTimeout(sidecarRestartTimer);
     sidecarRestartTimer = null;
+  }
+  if (updateCheckTimer) {
+    clearInterval(updateCheckTimer);
+    updateCheckTimer = null;
   }
   tray?.destroy();
   void (async () => {

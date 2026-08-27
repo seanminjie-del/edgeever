@@ -3,7 +3,6 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Navigate, Route, Routes, useNavigate } from "react-router";
 import { useTranslation } from "react-i18next";
 import { PwaUpdateNotice } from "@/components/PwaUpdateNotice";
-import { ReleaseUpdateNotice } from "@/components/ReleaseUpdateNotice";
 import { PwaInstallProvider } from "@/components/PwaInstallContext";
 import { PwaIosPrompt } from "@/components/PwaIosPrompt";
 import { Button } from "@/components/ui/button";
@@ -15,7 +14,7 @@ import {
   getCachedDesktopSession,
   saveDesktopApiBaseUrl,
 } from "@/lib/api";
-import { classifyLoginError, type LoginProblem } from "@/lib/login-error";
+import { classifyLoginError, getLoginProblemMessageKey } from "@/lib/login-error";
 import { EVERNOTE_MIGRATION_PATH } from "@/lib/routes";
 import { isBrowserOffline } from "@/lib/network-status";
 import type { AuthSession } from "@edgeever/shared";
@@ -25,6 +24,7 @@ const EvernoteImportGuidePane = lazy(() =>
 );
 const LoginScreen = lazy(() => import("@/components/LoginScreen").then((module) => ({ default: module.LoginScreen })));
 const WorkspaceApp = lazy(() => import("@/components/WorkspaceApp").then((module) => ({ default: module.WorkspaceApp })));
+const PublicSharePage = lazy(() => import("@/components/PublicSharePage").then((module) => ({ default: module.PublicSharePage })));
 
 const AuthLoadingScreen = ({ title = "EdgeEver", detail }: { title?: string; detail?: string }) => (
   <div className="flex h-[100dvh] items-center justify-center bg-slate-50 px-6 text-center text-slate-700">
@@ -159,38 +159,12 @@ const AuthenticatedWorkspace = () => {
     : sessionQuery.error
       ? classifyLoginError(sessionQuery.error, "session")
       : null;
-  const problemMessage = (value: LoginProblem) => {
-    switch (value.kind) {
-      case "invalidInstanceUrl":
-        return t("login.desktopInstanceUrlInvalid");
-      case "instanceUnreachable":
-        return t("login.instanceUnreachable");
-      case "instanceApiNotFound":
-        return t("login.instanceApiNotFound");
-      case "invalidCredentials":
-        return t("login.invalidCredentials");
-      case "sessionExpired":
-        return t("login.sessionExpired");
-      case "loginRateLimited":
-        return t("login.loginRateLimited");
-      case "authNotConfigured":
-        return t("login.authNotConfigured");
-      case "databaseNotReady":
-        return t("login.databaseNotReady");
-      case "passwordHashInvalid":
-        return t("login.passwordHashInvalid");
-      case "instanceServerError":
-        return t("login.instanceServerError", { status: value.status });
-      case "requestRejected":
-        return t("login.requestRejected", { status: value.status });
-      case "invalidResponse":
-        return t("login.invalidInstanceResponse");
-      case "unexpected":
-        return t("login.unexpectedError");
-    }
-  };
   const loginError = problem
-    ? { message: problemMessage(problem), diagnosticCode: problem.diagnosticCode }
+    ? {
+        message: t(getLoginProblemMessageKey(problem), "status" in problem ? { status: problem.status } : undefined),
+        diagnosticCode: problem.diagnosticCode,
+        rayId: problem.rayId,
+      }
     : null;
 
   if (desktopBridge?.isAvailable && !desktopScopeReady) {
@@ -224,16 +198,13 @@ const AuthenticatedWorkspace = () => {
 
   return (
     <Suspense fallback={<AuthLoadingScreen />}>
-      <>
-        <WorkspaceApp
-          authRequired={session.authRequired}
-          demoMode={session.demoMode}
-          isLoggingOut={logoutMutation.isPending}
-          user={session.user}
-          onLogout={() => logoutMutation.mutate()}
-        />
-        <ReleaseUpdateNotice />
-      </>
+      <WorkspaceApp
+        authRequired={session.authRequired}
+        demoMode={session.demoMode}
+        isLoggingOut={logoutMutation.isPending}
+        user={session.user}
+        onLogout={() => logoutMutation.mutate()}
+      />
     </Suspense>
   );
 };
@@ -248,10 +219,14 @@ export const App = () => {
   return (
     <PwaInstallProvider>
       <Routes>
+        <Route path="/share/:token" element={<Suspense fallback={<AuthLoadingScreen />}><PublicSharePage /></Suspense>} />
         <Route path={EVERNOTE_MIGRATION_PATH} element={<EvernoteMigrationRoute />} />
         <Route path="/" element={<AuthenticatedWorkspace />} />
         <Route path="/settings" element={<AuthenticatedWorkspace />} />
+        <Route path="/plugins" element={<AuthenticatedWorkspace />} />
+        <Route path="/plugins/:pluginId" element={<AuthenticatedWorkspace />} />
         <Route path="/templates" element={<AuthenticatedWorkspace />} />
+        <Route path="/ai-prompts" element={<AuthenticatedWorkspace />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
       <PwaUpdateNotice />

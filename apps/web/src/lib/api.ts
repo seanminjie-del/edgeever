@@ -6,25 +6,55 @@ import type {
   CreatedApiToken,
   JsonBackupMemo,
   JsonBackupNotebook,
+  JsonBackupAiPrompt,
   JsonBackupRevision,
   MemoDetail,
   MemoTemplate,
   MemoEditSession,
   MemoRevision,
   MemoSummary,
+  MemoShare,
   Notebook,
   Resource,
   ResourceListItem,
   ResourceStorageSummary,
+  ObjectStorageSettings,
+  AiSettings,
+  AiDiscoveredModel,
+  AiProvider,
+  AiPromptTemplate,
+  AiPromptTemplateCreateInput,
+  AiPromptTemplateUpdateInput,
+  AiStreamEvent,
+  AiGenerateInput,
+  AiTagSuggestionPromptUpdateInput,
+  AiTagSuggestionsRequestInput,
+  AiTagSuggestionsResponse,
+  PublicMemoShare,
   TagSummary,
   TiptapDoc,
   SyncBootstrapResponse,
   SyncChangesResponse,
 } from "@edgeever/shared";
+import { resolveInstanceUrlInput } from "@edgeever/shared";
 import type { MemoFilterMode, MemoSortMode } from "./app-helpers";
+import { readAiStreamingPreference } from "./ai-generation-preference";
+import { createClientUuid } from "./client-id";
 
 type ListNotebooksResponse = {
   notebooks: Notebook[];
+};
+
+export type InstanceRelease = {
+  version: string;
+  changes: Record<string, string[]>;
+};
+
+export type InstanceHealth = {
+  ok: true;
+  name: string;
+  runtime: string;
+  authMode: string;
 };
 
 type ListMemosResponse = {
@@ -56,6 +86,26 @@ type ListApiTokensResponse = {
 type ListUsersResponse = { users: InstanceUser[] };
 type UserResponse = { user: InstanceUser };
 type ListLoginDeviceSessionsResponse = { sessions: LoginDeviceSession[] };
+type ObjectStorageSettingsResponse = {
+  settings: ObjectStorageSettings;
+  externalSettings?: ObjectStorageSettings | null;
+};
+export type AiProviderCreatePayload = {
+  provider: AiProvider;
+  displayName: string;
+  baseUrl: string;
+  apiKey: string;
+  isEnabled: boolean;
+  initialModelId?: string;
+};
+
+export type AiProviderUpdatePayload = {
+  provider: AiProvider;
+  displayName: string;
+  baseUrl: string;
+  apiKey?: string;
+  isEnabled: boolean;
+};
 
 const WEB_DEVICE_ID_STORAGE_KEY = "edgeever.web.device-id";
 export const DESKTOP_API_BASE_URL_STORAGE_KEY = "edgeever.desktop.api-base-url";
@@ -158,7 +208,7 @@ export class DesktopInstanceUrlError extends Error {
 }
 
 export const saveDesktopApiBaseUrl = async (value: string) => {
-  const normalized = value.trim().replace(/\/$/, "");
+  const normalized = resolveInstanceUrlInput(value).replace(/\/$/, "");
   let parsed: URL;
   try {
     parsed = new URL(normalized);
@@ -178,10 +228,7 @@ export const saveDesktopApiBaseUrl = async (value: string) => {
 };
 
 const createWebDeviceId = () => {
-  const uuid = globalThis.crypto?.randomUUID?.();
-  return uuid
-    ? `web-${uuid}`
-    : `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`;
+  return `web-${createClientUuid()}`;
 };
 
 const getOrCreateWebDeviceId = () => {
@@ -200,6 +247,8 @@ const getOrCreateWebDeviceId = () => {
 type MemoResponse = {
   memo: MemoDetail;
 };
+
+export type MemoShareResponse = { share: MemoShare | null };
 
 type TemplateResponse = {
   template: MemoTemplate;
@@ -227,26 +276,104 @@ export type JsonBackupPage = MarkdownExportPage & {
 export class ApiRequestError extends Error {
   status: number;
   code?: string;
+  details?: unknown;
+  responseDiagnostics?: ApiResponseDiagnostics;
 
-  constructor(message: string, status: number, code?: string) {
+  constructor(
+    message: string,
+    status: number,
+    code?: string,
+    details?: unknown,
+    responseDiagnostics?: ApiResponseDiagnostics,
+  ) {
     super(message);
     this.name = "ApiRequestError";
     this.status = status;
     this.code = code;
+    this.details = details;
+    this.responseDiagnostics = responseDiagnostics;
   }
 }
 
-let desktopSessionRejected = false;
+export type ApiResponseDiagnostics = {
+  cloudflareMitigated: boolean;
+  isEdgeEverApiError: boolean;
+  rayId?: string;
+};
 
-const isDesktopAuthenticationRequest = (path: string) =>
-  path === "/api/v1/auth/login" || path === "/api/v1/auth/session";
+let desktopSessionRejected = false;
+let unauthorizedConfirmPromise: Promise<boolean> | null = null;
+
+const isDesktopPublicRequest = (path: string) =>
+  path === "/api/release" || path === "/api/v1/auth/login" || path === "/api/v1/auth/session";
+
+/**
+ * Confirm the browser is actually logged out before forcing the login screen.
+ * A single flaky 401 (or a mid-session local-dev auth mode flip) should not
+ * wipe the whole workspace if the session cookie is still valid.
+ */
+const confirmSessionLost = async (): Promise<boolean> => {
+  if (typeof window === "undefined") return true;
+  if (unauthorizedConfirmPromise) return unauthorizedConfirmPromise;
+
+  unauthorizedConfirmPromise = (async () => {
+    try {
+      const headers = new Headers();
+      const isDesktop = Boolean(window.edgeeverDesktop?.isAvailable);
+      const sessionToken = isDesktop ? getDesktopSessionToken() : undefined;
+      if (sessionToken) headers.set("Authorization", `Bearer ${sessionToken}`);
+      const baseUrl = getConfiguredDesktopApiBaseUrl();
+      const response = await fetch(`${baseUrl}/api/v1/auth/session`, {
+        credentials: "include",
+        headers,
+      });
+      if (!response.ok) return true;
+      const session = await response.json().catch(() => null) as AuthSession | null;
+      return !session?.authenticated;
+    } catch {
+      return true;
+    } finally {
+      // Allow a later 401 to re-check after this round finishes.
+      queueMicrotask(() => {
+        unauthorizedConfirmPromise = null;
+      });
+    }
+  })();
+
+  return unauthorizedConfirmPromise;
+};
+
+const notifyUnauthorized = async (isDesktop: boolean, rejectedDesktopSessionToken?: string) => {
+  if (isDesktop && desktopSessionRejected) return;
+
+  // A desktop API request authenticates with one explicit bearer token. A 401
+  // therefore rejects that exact credential and does not need a second
+  // /auth/session request. Compare against the current token first so a late
+  // response from an older request cannot clear a freshly logged-in session.
+  if (isDesktop && rejectedDesktopSessionToken) {
+    if (getDesktopSessionToken() !== rejectedDesktopSessionToken) return;
+    clearCachedDesktopSession();
+    desktopSessionRejected = true;
+    window.dispatchEvent(new CustomEvent("edgeever:unauthorized"));
+    return;
+  }
+
+  const sessionLost = await confirmSessionLost();
+  if (!sessionLost) return;
+
+  if (isDesktop) {
+    clearCachedDesktopSession();
+    desktopSessionRejected = true;
+  }
+  window.dispatchEvent(new CustomEvent("edgeever:unauthorized"));
+};
 
 const request = async <T>(path: string, init?: RequestInit): Promise<T> => {
   const headers = new Headers(init?.headers);
-  const isDesktop = Boolean(window.edgeeverDesktop?.isAvailable);
+  const isDesktop = Boolean(typeof window !== "undefined" && window.edgeeverDesktop?.isAvailable);
   const sessionToken = isDesktop ? getDesktopSessionToken() : undefined;
 
-  if (isDesktop && desktopSessionRejected && !isDesktopAuthenticationRequest(path)) {
+  if (isDesktop && desktopSessionRejected && !isDesktopPublicRequest(path)) {
     throw new ApiRequestError("Authentication required", 401, "unauthorized");
   }
 
@@ -267,25 +394,32 @@ const request = async <T>(path: string, init?: RequestInit): Promise<T> => {
 
   if (!response.ok) {
     const body = await response.json().catch(() => null);
-    const error = body && typeof body === "object" && "error" in body ? (body as { error?: { code?: string; message?: string } }).error : undefined;
+    const rayId = response.headers.get("cf-ray")?.trim();
+    const error = body && typeof body === "object" && "error" in body
+      ? (body as { error?: { code?: string; message?: string; details?: unknown } }).error
+      : undefined;
+    const isEdgeEverApiError = Boolean(error && typeof error === "object");
     const message =
       body && typeof body === "object" && "error" in body
         ? error?.message
         : response.statusText;
+    const responseDiagnostics: ApiResponseDiagnostics = {
+      cloudflareMitigated: response.headers.get("cf-mitigated") === "challenge",
+      isEdgeEverApiError,
+      ...(rayId ? { rayId } : {}),
+    };
 
-    if (response.status === 401) {
-      if (isDesktop) {
-        clearCachedDesktopSession();
-        if (!desktopSessionRejected) {
-          desktopSessionRejected = true;
-          window.dispatchEvent(new CustomEvent("edgeever:unauthorized"));
-        }
-      } else {
-        window.dispatchEvent(new CustomEvent("edgeever:unauthorized"));
-      }
+    if (response.status === 401 && path !== "/api/v1/auth/login") {
+      void notifyUnauthorized(isDesktop, sessionToken);
     }
 
-    throw new ApiRequestError(message || "Request failed", response.status, error?.code);
+    throw new ApiRequestError(
+      message || "Request failed",
+      response.status,
+      error?.code,
+      error?.details,
+      responseDiagnostics,
+    );
   }
 
   const body = await response.json() as T;
@@ -308,8 +442,32 @@ const request = async <T>(path: string, init?: RequestInit): Promise<T> => {
   return body;
 };
 
+const requestArrayBuffer = async (path: string) => {
+  const isDesktop = Boolean(typeof window !== "undefined" && window.edgeeverDesktop?.isAvailable);
+  const sessionToken = isDesktop ? getDesktopSessionToken() : undefined;
+  const headers = new Headers();
+  if (sessionToken) headers.set("Authorization", `Bearer ${sessionToken}`);
+  const response = await fetch(`${getConfiguredDesktopApiBaseUrl()}${path}`, {
+    credentials: "include",
+    headers,
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => null) as { error?: { message?: string } } | null;
+    if (response.status === 401) void notifyUnauthorized(isDesktop, sessionToken);
+    throw new ApiRequestError(body?.error?.message || response.statusText || "Binary download failed", response.status);
+  }
+  return response.arrayBuffer();
+};
+
 export const api = {
+  getInstanceHealth: () => request<InstanceHealth>("/api/health"),
+
+  getInstanceRelease: () => request<InstanceRelease>("/api/release"),
+
   getSession: () => request<AuthSession>("/api/v1/auth/session"),
+
+  getPublicMemoShare: (token: string) =>
+    request<{ share: PublicMemoShare }>(`/api/public/shares/${encodeURIComponent(token)}`),
 
   listLoginDeviceSessions: () =>
     request<ListLoginDeviceSessionsResponse>("/api/v1/auth/sessions"),
@@ -352,6 +510,39 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
+  getObjectStorageSettings: () =>
+    request<ObjectStorageSettingsResponse>("/api/v1/instance/object-storage"),
+
+  testObjectStorageConnection: (payload: {
+    endpoint: string;
+    region: string;
+    bucket: string;
+    accessKeyId: string;
+    secretAccessKey?: string;
+    forcePathStyle: boolean;
+    objectPrefix: string;
+  }) => request<{ ok: true }>("/api/v1/instance/object-storage/test", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  }),
+
+  updateObjectStorageSettings: (payload:
+    | { provider: "builtin" }
+    | {
+        provider: "s3";
+        displayName: string;
+        endpoint: string;
+        region: string;
+        bucket: string;
+        accessKeyId: string;
+        secretAccessKey?: string;
+        forcePathStyle: boolean;
+        objectPrefix: string;
+      }) => request<ObjectStorageSettingsResponse>("/api/v1/instance/object-storage", {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      }),
+
   logout: () =>
     request<{ ok: true }>("/api/v1/auth/logout", {
       method: "POST",
@@ -379,6 +570,151 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload),
     }),
+
+  getAiSettings: (locale?: string) => {
+    const search = locale ? `?locale=${encodeURIComponent(locale)}` : "";
+    return request<AiSettings>(`/api/v1/ai/settings${search}`);
+  },
+
+  createAiProvider: (payload: AiProviderCreatePayload) =>
+    request<AiSettings>("/api/v1/ai/providers", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+
+  updateAiProvider: (providerConfigId: string, payload: AiProviderUpdatePayload) =>
+    request<AiSettings>(`/api/v1/ai/providers/${encodeURIComponent(providerConfigId)}`, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    }),
+
+  deleteAiProvider: (providerConfigId: string) =>
+    request<AiSettings>(`/api/v1/ai/providers/${encodeURIComponent(providerConfigId)}`, {
+      method: "DELETE",
+    }),
+
+  testAiProvider: (providerConfigId: string, payload: {
+    modelId: string;
+    provider?: AiProvider;
+    baseUrl?: string;
+    apiKey?: string;
+  }) =>
+    request<{ ok: true; response: string }>(`/api/v1/ai/providers/${encodeURIComponent(providerConfigId)}/test`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+
+  discoverAiProviderModels: (providerConfigId: string) =>
+    request<{ models: AiDiscoveredModel[] }>(`/api/v1/ai/providers/${encodeURIComponent(providerConfigId)}/discover-models`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
+
+  addAiModel: (providerConfigId: string, payload: { modelId: string; displayName?: string }) =>
+    request<AiSettings>(`/api/v1/ai/providers/${encodeURIComponent(providerConfigId)}/models`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+
+  deleteAiModel: (providerConfigId: string, modelConfigId: string) =>
+    request<AiSettings>(`/api/v1/ai/providers/${encodeURIComponent(providerConfigId)}/models/${encodeURIComponent(modelConfigId)}`, {
+      method: "DELETE",
+    }),
+
+  updateDefaultAiModel: (modelConfigId: string | null) =>
+    request<AiSettings>("/api/v1/ai/default-model", {
+      method: "PUT",
+      body: JSON.stringify({ modelConfigId }),
+    }),
+
+  updateAiTagSuggestionPrompt: (payload: AiTagSuggestionPromptUpdateInput, locale?: string) =>
+    request<AiSettings>(`/api/v1/ai/tag-suggestion-prompt${locale ? `?locale=${encodeURIComponent(locale)}` : ""}`, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    }),
+
+  listAiPrompts: (locale?: string) => {
+    const search = locale ? `?locale=${encodeURIComponent(locale)}` : "";
+    return request<{ prompts: AiPromptTemplate[] }>(`/api/v1/ai/prompts${search}`);
+  },
+
+  createAiPrompt: (payload: AiPromptTemplateCreateInput) =>
+    request<{ prompt: AiPromptTemplate }>("/api/v1/ai/prompts", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+
+  updateAiPrompt: (
+    promptId: string,
+    payload: AiPromptTemplateUpdateInput,
+  ) =>
+    request<{ prompt: AiPromptTemplate }>(`/api/v1/ai/prompts/${encodeURIComponent(promptId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
+
+  deleteAiPrompt: (promptId: string) =>
+    request<{ ok: true }>(`/api/v1/ai/prompts/${encodeURIComponent(promptId)}`, {
+      method: "DELETE",
+    }),
+
+  restoreDefaultAiPrompts: (locale?: string) => {
+    const search = locale ? `?locale=${encodeURIComponent(locale)}` : "";
+    return request<{ prompts: AiPromptTemplate[]; restoredCount: number }>(`/api/v1/ai/prompts/restore-defaults${search}`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+  },
+
+  suggestAiTags: (payload: AiTagSuggestionsRequestInput, signal?: AbortSignal) =>
+    request<AiTagSuggestionsResponse>("/api/v1/ai/tag-suggestions", {
+      method: "POST",
+      body: JSON.stringify(payload),
+      signal,
+    }),
+
+  streamAiGeneration: async (
+    payload: AiGenerateInput,
+    options: { signal?: AbortSignal; onEvent: (event: AiStreamEvent) => void },
+  ) => {
+    const headers = new Headers({ "Content-Type": "application/json" });
+    const sessionToken = typeof window !== "undefined" && window.edgeeverDesktop?.isAvailable
+      ? getDesktopSessionToken()
+      : undefined;
+    if (sessionToken) headers.set("Authorization", `Bearer ${sessionToken}`);
+    const response = await fetch(`${getConfiguredDesktopApiBaseUrl()}/api/v1/ai/generate`, {
+      method: "POST",
+      credentials: "include",
+      headers,
+      body: JSON.stringify({
+        ...payload,
+        stream: payload.stream ?? readAiStreamingPreference(),
+      }),
+      signal: options.signal,
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => null) as { error?: { code?: string; message?: string } } | null;
+      throw new ApiRequestError(body?.error?.message || response.statusText, response.status, body?.error?.code);
+    }
+    if (!response.body) throw new ApiRequestError("Streaming response is unavailable", 502, "ai_stream_unavailable");
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += decoder.decode(value, { stream: !done });
+      const frames = buffer.split("\n\n");
+      buffer = frames.pop() ?? "";
+      for (const frame of frames) {
+        const data = frame.split("\n").find((line) => line.startsWith("data: "))?.slice(6);
+        if (data) options.onEvent(JSON.parse(data) as AiStreamEvent);
+      }
+      if (done) break;
+    }
+    const trailingData = buffer.split("\n").find((line) => line.startsWith("data: "))?.slice(6);
+    if (trailingData) options.onEvent(JSON.parse(trailingData) as AiStreamEvent);
+  },
 
   updateNotebook: (notebookId: string, payload: { name?: string; parentId?: string | null; sortOrder?: number }) =>
     request<NotebookResponse>(`/api/v1/notebooks/${notebookId}`, {
@@ -426,6 +762,7 @@ export const api = {
     notebookId?: string | null;
     includeDescendants?: boolean;
     q?: string;
+    tag?: string;
     trash?: boolean;
     sort?: MemoSortMode;
     filter?: MemoFilterMode;
@@ -444,6 +781,10 @@ export const api = {
 
     if (params.q?.trim()) {
       search.set("q", params.q.trim());
+    }
+
+    if (params.tag?.trim()) {
+      search.set("tag", params.tag.trim());
     }
 
     if (params.trash) {
@@ -526,6 +867,18 @@ export const api = {
     return request<MemoResponse>(`/api/v1/memos/${memoId}${suffix}`);
   },
 
+  getMemoShare: (memoId: string) =>
+    request<MemoShareResponse>(`/api/v1/memos/${memoId}/share`),
+
+  createMemoShare: (memoId: string) =>
+    request<{ share: MemoShare }>(`/api/v1/memos/${memoId}/share`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
+
+  revokeMemoShare: (memoId: string) =>
+    request<{ ok: true }>(`/api/v1/memos/${memoId}/share`, { method: "DELETE" }),
+
   createMemoEditSession: (memoId: string) =>
     request<{ editSession: MemoEditSession }>(`/api/v1/memos/${memoId}/edit-sessions`, {
       method: "POST",
@@ -542,6 +895,17 @@ export const api = {
     }),
 
   listResources: () => request<ListResourcesResponse>("/api/v1/resources"),
+
+  renameResource: (resourceId: string, filename: string) =>
+    request<ResourceResponse>(`/api/v1/resources/${encodeURIComponent(resourceId)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ filename }),
+    }),
+
+  deleteResource: (resourceId: string) =>
+    request<{ ok: true }>(`/api/v1/resources/${encodeURIComponent(resourceId)}`, {
+      method: "DELETE",
+    }),
 
   getMarkdownExportPage: (offset = 0, limit = 50) =>
     request<MarkdownExportPage>(`/api/v1/exports/markdown?offset=${offset}&limit=${limit}`),
@@ -561,6 +925,12 @@ export const api = {
       body: JSON.stringify({ memos }),
     }),
 
+  restoreJsonAiPrompts: (prompts: JsonBackupAiPrompt[]) =>
+    request<{ ok: true }>("/api/v1/restores/json/ai-prompts", {
+      method: "POST",
+      body: JSON.stringify({ prompts }),
+    }),
+
   restoreJsonResource: (resourceId: string, metadata: JsonBackupMemo["resources"][number], file: Blob) => {
     const form = new FormData();
     form.append("metadata", JSON.stringify(metadata));
@@ -577,7 +947,7 @@ export const api = {
 
     if (!response.ok) {
       if (response.status === 401) {
-        window.dispatchEvent(new CustomEvent("edgeever:unauthorized"));
+        void notifyUnauthorized(Boolean(window.edgeeverDesktop?.isAvailable));
       }
 
       throw new ApiRequestError(response.statusText || "Resource download failed", response.status);
@@ -585,6 +955,15 @@ export const api = {
 
     return response.blob();
   },
+
+  downloadGithubPluginAsset: (
+    owner: string,
+    repository: string,
+    assetId: number,
+    assetName: "manifest.json" | "main.js" | "styles.css",
+  ) => requestArrayBuffer(
+    `/api/v1/plugins/github/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/assets/${assetId}/${encodeURIComponent(assetName)}`,
+  ),
 
   uploadMemoResource: (memoId: string, file: File) => {
     const form = new FormData();

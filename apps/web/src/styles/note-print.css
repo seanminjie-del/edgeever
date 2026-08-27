@@ -21,6 +21,13 @@
   box-sizing: border-box;
 }
 
+.edgeever-print-content .tiptap-mathematics-render[data-type="block-math"] {
+  max-width: 100%;
+  margin: 5mm 0;
+  overflow: hidden;
+  text-align: center;
+}
+
 .edgeever-print-document {
   color: #172033;
   font-family: "Noto Sans SC Variable", sans-serif;
@@ -89,6 +96,46 @@
   margin: 1mm 0;
 }
 
+.edgeever-print-content ul[data-type="taskList"] {
+  padding-left: 0;
+  list-style: none;
+}
+
+.edgeever-print-content ul[data-type="taskList"] li[data-checked] {
+  display: flex;
+  align-items: flex-start;
+  gap: 2mm;
+  break-inside: avoid-page;
+}
+
+.edgeever-print-content ul[data-type="taskList"] li[data-checked] > label {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  margin-top: 0.8mm;
+}
+
+.edgeever-print-content ul[data-type="taskList"] li[data-checked] > label input {
+  width: 4mm;
+  height: 4mm;
+  margin: 0;
+  accent-color: #16a06e;
+}
+
+.edgeever-print-content ul[data-type="taskList"] li[data-checked] > div {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.edgeever-print-content ul[data-type="taskList"] li[data-checked] > div > p {
+  margin-bottom: 0;
+}
+
+.edgeever-print-content ul[data-type="taskList"] ul[data-type="taskList"] {
+  margin: 1mm 0 0;
+  padding-left: 6mm;
+}
+
 .edgeever-print-content blockquote {
   break-inside: avoid-page;
   margin: 4mm 0;
@@ -102,6 +149,15 @@
   margin: 7mm 0;
   border: 0;
   border-top: 0.3mm solid #cbd5e1;
+}
+
+.edgeever-print-content hr.edgeever-merge-divider,
+.edgeever-print-content hr[data-edgeever-merge-divider] {
+  margin: 8mm 0;
+  border: 0;
+  border-top: 0.5mm solid #66ca80;
+  background: transparent;
+  height: 0;
 }
 
 .edgeever-print-content a {
