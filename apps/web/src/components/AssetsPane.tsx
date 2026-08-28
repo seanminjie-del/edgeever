@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import Lightbox from "yet-another-react-lightbox";
 import Zoom from "yet-another-react-lightbox/plugins/zoom";
@@ -11,20 +11,14 @@ import "yet-another-react-lightbox/plugins/thumbnails.css";
 import {
   Archive,
   HardDrive,
-  ImageIcon,
-  File as FileIcon,
   ExternalLink,
   ChevronLeft,
   Search,
   Grid,
   List,
-  FileText,
-  FileSpreadsheet,
-  FileArchive,
-  Music,
-  Video,
   X,
   Loader2,
+  Trash2,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -35,6 +29,8 @@ import type { EdgeEverRepository } from "@/lib/repository";
 import { isPdfAttachment, type ResourceListItem } from "@edgeever/shared";
 import { PdfViewer } from "@/components/pdf/PdfViewer";
 import { PdfThumbnail } from "@/components/pdf/PdfThumbnail";
+import { AttachmentFileIcon } from "@/components/attachments/AttachmentFileIcon";
+import { AppConfirmDialog } from "@/components/dialogs/ConfirmDialogs";
 
 export const formatBytes = (bytes: number) => {
   if (!Number.isFinite(bytes) || bytes <= 0) {
@@ -65,53 +61,6 @@ const DOCUMENT_MIME_TYPES = new Set([
   "text/javascript",
 ]);
 
-const getFileIcon = (mimeType: string | null, filename: string | null) => {
-  const mime = (mimeType || "").toLowerCase();
-  const ext = (filename || "").split(".").pop()?.toLowerCase() || "";
-
-  if (mime.startsWith("image/")) return <ImageIcon className="h-8 w-8 text-emerald-500" />;
-  if (mime.startsWith("audio/")) return <Music className="h-8 w-8 text-sky-500" />;
-  if (mime.startsWith("video/")) return <Video className="h-8 w-8 text-rose-500" />;
-
-  if (mime === "application/pdf" || ext === "pdf") {
-    return <FileText className="h-8 w-8 text-rose-600" />;
-  }
-
-  if (
-    mime.includes("spreadsheet") ||
-    mime.includes("excel") ||
-    ext === "xls" ||
-    ext === "xlsx" ||
-    ext === "csv"
-  ) {
-    return <FileSpreadsheet className="h-8 w-8 text-green-600" />;
-  }
-
-  if (
-    mime.includes("word") ||
-    mime.includes("officedocument.wordprocessingml") ||
-    ext === "doc" ||
-    ext === "docx"
-  ) {
-    return <FileText className="h-8 w-8 text-blue-600" />;
-  }
-
-  if (
-    mime.includes("zip") ||
-    mime.includes("tar") ||
-    mime.includes("rar") ||
-    mime.includes("gzip") ||
-    ext === "zip" ||
-    ext === "rar" ||
-    ext === "tar" ||
-    ext === "gz"
-  ) {
-    return <FileArchive className="h-8 w-8 text-amber-500" />;
-  }
-
-  return <FileIcon className="h-8 w-8 text-slate-400" />;
-};
-
 interface AssetsPaneProps {
   onClose: () => void;
   repository: EdgeEverRepository;
@@ -119,6 +68,7 @@ interface AssetsPaneProps {
 
 export const AssetsPane = ({ onClose, repository }: AssetsPaneProps) => {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
 
   // States
   const [searchQuery, setSearchQuery] = useState("");
@@ -128,6 +78,7 @@ export const AssetsPane = ({ onClose, repository }: AssetsPaneProps) => {
   });
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
   const [pdfPreview, setPdfPreview] = useState<ResourceListItem | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<ResourceListItem | null>(null);
 
   // Query resources
   const resourcesQuery = useQuery({
@@ -141,6 +92,19 @@ export const AssetsPane = ({ onClose, repository }: AssetsPaneProps) => {
     totalBytes: 0,
     imageCount: 0,
     attachmentCount: 0,
+  };
+
+  const deleteMutation = useMutation({
+    mutationFn: (resourceId: string) => repository.deleteResource(resourceId),
+    onSuccess: async () => {
+      setDeleteTarget(null);
+      await queryClient.invalidateQueries({ queryKey: ["resources"] });
+    },
+  });
+
+  const requestResourceDelete = (resource: ResourceListItem) => {
+    deleteMutation.reset();
+    setDeleteTarget(resource);
   };
 
   // Filter Logic
@@ -360,6 +324,18 @@ export const AssetsPane = ({ onClose, repository }: AssetsPaneProps) => {
                   key={resource.id}
                   className="group relative flex flex-col overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm transition-all duration-200 hover:border-emerald-500/40 hover:shadow-md"
                 >
+                  <ButtonTooltip title={t("assets.deleteAria", { filename: resource.filename || resource.id })}>
+                    <Button
+                      type="button"
+                      size="icon"
+                      variant="ghost"
+                      aria-label={t("assets.deleteAria", { filename: resource.filename || resource.id })}
+                      className="absolute right-2 top-2 z-10 h-8 w-8 bg-white/90 text-slate-500 opacity-0 shadow-sm transition-opacity hover:bg-rose-50 hover:text-rose-600 focus:opacity-100 group-hover:opacity-100"
+                      onClick={() => requestResourceDelete(resource)}
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
+                  </ButtonTooltip>
                   {/* Thumbnail area */}
                   <div
                     role="button"
@@ -390,7 +366,7 @@ export const AssetsPane = ({ onClose, repository }: AssetsPaneProps) => {
                       />
                     ) : (
                       <div className="flex flex-col items-center gap-1.5 p-3 text-center">
-                        {getFileIcon(resource.mimeType, resource.filename)}
+                        <AttachmentFileIcon mimeType={resource.mimeType} filename={resource.filename} />
                         <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[9px] font-bold text-slate-500 uppercase tracking-wider">
                           {(resource.filename || "").split(".").pop() || "FILE"}
                         </span>
@@ -470,7 +446,7 @@ export const AssetsPane = ({ onClose, repository }: AssetsPaneProps) => {
                         className="p-1"
                       />
                     ) : (
-                      getFileIcon(resource.mimeType, resource.filename)
+                      <AttachmentFileIcon mimeType={resource.mimeType} filename={resource.filename} />
                     )}
                   </div>
 
@@ -489,6 +465,18 @@ export const AssetsPane = ({ onClose, repository }: AssetsPaneProps) => {
                   </div>
 
                   {/* Right Actions */}
+                  <ButtonTooltip title={t("assets.deleteAria", { filename: resource.filename || resource.id })}>
+                    <Button
+                      type="button"
+                      size="icon"
+                      variant="ghost"
+                      aria-label={t("assets.deleteAria", { filename: resource.filename || resource.id })}
+                      className="h-8 w-8 text-slate-350 opacity-0 transition-all duration-150 hover:bg-rose-50 hover:text-rose-600 focus:opacity-100 group-hover:opacity-100"
+                      onClick={() => requestResourceDelete(resource)}
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
+                  </ButtonTooltip>
                   <ButtonTooltip title={t("assets.openInNewWindow")}>
                     <a
                       href={resource.url}
@@ -522,10 +510,26 @@ export const AssetsPane = ({ onClose, repository }: AssetsPaneProps) => {
           key={pdfPreview.id}
           url={pdfPreview.url}
           label={pdfPreview.filename || pdfPreview.id}
+          filename={pdfPreview.filename || undefined}
+          byteSize={pdfPreview.byteSize}
           fullscreen
           onRequestClose={() => setPdfPreview(null)}
           onPrevious={pdfResources.length > 1 ? showPreviousPdf : undefined}
           onNext={pdfResources.length > 1 ? showNextPdf : undefined}
+        />
+      ) : null}
+      {deleteTarget ? (
+        <AppConfirmDialog
+          title={t("assets.deleteTitle")}
+          description={t("assets.deleteDescription")}
+          confirmLabel={t("common.delete")}
+          error={deleteMutation.error instanceof Error ? deleteMutation.error.message : null}
+          isWorking={deleteMutation.isPending}
+          onCancel={() => {
+            deleteMutation.reset();
+            setDeleteTarget(null);
+          }}
+          onConfirm={() => deleteMutation.mutate(deleteTarget.id)}
         />
       ) : null}
     </div>
